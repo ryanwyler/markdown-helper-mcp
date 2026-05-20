@@ -167,7 +167,7 @@ def _build_file_summary(
             entry: dict[str, Any] = {
                 "filename": canonical,
                 "workspaceState": "open",
-                "schema": list(schema.names()),
+                "schema": schema.to_response(),
                 "sectionCount": section_count,
                 "stateCounts": dict(sorted(counts.items())),
                 "createdAt": int(created_at) if created_at and created_at.isdigit() else None,

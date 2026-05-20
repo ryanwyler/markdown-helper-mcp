@@ -92,6 +92,9 @@ CREATE TABLE IF NOT EXISTS sections (
     updated_at      INTEGER NOT NULL,
     updated_by      TEXT,
     session_id      TEXT,
+    tags            TEXT,                    -- JSON array of lowercase
+                                             -- tag strings; NULL or '[]'
+                                             -- when empty
     FOREIGN KEY (parent_id)       REFERENCES sections(id),
     FOREIGN KEY (prev_sibling_id) REFERENCES sections(id)
 );
@@ -173,14 +176,14 @@ def find_helper_root(start: Path | None = None) -> Path:
 # is computed once per process (CLI invocation) and used as the implicit
 # prefix for every local filename:
 #
-#   project_root = ~/src/utils                  (the nearest .git ancestor)
-#   cwd          = ~/src/utils/markdown-helper
-#   dir          = "markdown-helper"
+#   project_root = ~/src/myproject                (the nearest .git ancestor)
+#   cwd          = ~/src/myproject/sub-tool
+#   dir          = "sub-tool"
 #
 # When an agent in that cwd says filename="test/TEST.md", we read/write
 #
-#   ~/src/utils/markdown-helper/test/TEST.md                    (disk)
-#   ~/src/utils/.markdown-helper/markdown-helper/test/TEST.md/  (workspace)
+#   ~/src/myproject/sub-tool/test/TEST.md                    (disk)
+#   ~/src/myproject/.markdown-helper/sub-tool/test/TEST.md/  (workspace)
 #
 # When the agent's cwd IS the project root, `dir` is the empty string
 # and the layout collapses to the original
@@ -383,8 +386,6 @@ def resolve_filename(
       - A relative path that escapes the project via `..` (e.g.
         "../../other/docs/X.md") -- treated as foreign once realpath
         lands outside the project root
-      - The internal `ext/...` workspace key (back-compat with stored
-        keys; not something agents normally type)
 
     Returns the canonical agent-visible filename + the absolute disk
     path + the internal workspace key + a foreign flag. The single
@@ -419,19 +420,13 @@ def resolve_filename(
         project_root = find_project_root()
     project_root = project_root.resolve()
 
-    # Decide what absolute path the agent is referring to.
-    #
-    # (a) absolute -- use as given, then realpath
-    # (b) ext/ workspace key -- decode then realpath (back-compat)
-    # (c) relative -- join with cwd, then realpath; if that escapes
-    #     the project, treat as foreign
+    # Decide what absolute path the agent is referring to:
+    #   absolute -> use as given, then realpath
+    #   relative -> join with cwd, then realpath; if it escapes the
+    #               project, treat as foreign
     p = Path(filename)
     if p.is_absolute():
         disk_path = p.resolve(strict=False)
-    elif (filename == "ext" or filename.startswith(FOREIGN_PREFIX)
-          or filename.startswith("./" + FOREIGN_PREFIX)):
-        stripped = filename[2:] if filename.startswith("./") else filename
-        disk_path = _from_workspace_key(stripped).resolve(strict=False)
     else:
         # Cwd-relative path. Validate before joining: reject empty
         # components but ALLOW `..` so agents can naturally reach
@@ -443,13 +438,15 @@ def resolve_filename(
             parts.append(part)
         if not parts:
             raise ValueError(f"filename is empty after normalization: {filename!r}")
-        # Also reject the reserved ext/ prefix on plain-relative inputs
-        # so agents don't shadow the storage-encoded form.
+        # Reject the reserved "ext/" prefix -- it's the on-disk
+        # foreign workspace encoding and never something the agent
+        # should be typing.
         joined = "/".join(parts)
         if joined == "ext" or joined.startswith(FOREIGN_PREFIX):
             raise ValueError(
-                f"filename {filename!r} starts with the reserved 'ext/' prefix "
-                f"(used internally for foreign file workspaces). Pick a different name."
+                f"filename {filename!r} starts with the reserved 'ext/' prefix. "
+                f"Foreign files are addressed by their absolute realpath, not "
+                f"the on-disk encoding."
             )
         disk_path = (cwd_path(project_root) / Path(*parts)).resolve(strict=False)
 
@@ -573,26 +570,17 @@ def file_workspace_exists(root: Path, workspace_key: str) -> bool:
 
 
 def is_foreign_workspace_key(workspace_key: str) -> bool:
-    """True iff `workspace_key` is the on-disk foreign encoding."""
+    """True iff `workspace_key` is the on-disk foreign encoding
+    (starts with 'ext/')."""
     return workspace_key.startswith(FOREIGN_PREFIX)
 
 
-# Back-compat alias. Older code calls is_foreign_filename(canonical)
-# expecting the agent-facing form. The agent-facing canonical for
-# foreign files is now an absolute path starting with "/", so the
-# detection is "starts with /". For local canonicals it returns False.
 def is_foreign_filename(canonical: str) -> bool:
     """True iff `canonical` is the agent-facing form of a foreign file
-    (an absolute path starting with '/'). For local cwd-relative
-    canonicals, returns False."""
-    if not canonical:
-        return False
-    # Agent-facing canonical: foreign is always an absolute path.
-    if canonical.startswith("/"):
-        return True
-    # Tolerate the old "ext/..." form in case any caller still passes
-    # the workspace key by accident.
-    return canonical.startswith(FOREIGN_PREFIX)
+    (an absolute path starting with '/'). The agent never sees the
+    on-disk 'ext/...' form -- that's purely an internal workspace
+    cache layout."""
+    return bool(canonical) and canonical.startswith("/")
 
 
 def workspace_key_to_canonical(workspace_key: str) -> str:
@@ -630,15 +618,6 @@ def list_workspaces(root: Path) -> list[tuple[str, str]]:
         canonical = workspace_key_to_canonical(rel)
         out.append((canonical, rel))
     return out
-
-
-# Back-compat: old callers expect a list of strings (the agent-facing
-# canonicals). Prefer list_workspaces() in new code.
-def list_filenames(root: Path) -> list[str]:
-    """List the agent-facing canonical filename of every workspace
-    visible from the agent's current cwd. See list_workspaces() for
-    the version that also returns the internal workspace key."""
-    return [canonical for canonical, _ in list_workspaces(root)]
 
 
 # ---------------------------------------------------------------------------

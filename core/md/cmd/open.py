@@ -60,6 +60,7 @@ from ..storage import (
     resolve_filename,
     set_schema,
 )
+from ..trailer import apply_trailer, parse_trailer, strip_trailer
 from ..util import now
 
 
@@ -99,7 +100,13 @@ def cmd_open(args: argparse.Namespace) -> int:
         })
         return 1
 
-    text = src.read_text(encoding="utf-8")
+    raw_text = src.read_text(encoding="utf-8")
+    # Strip any trailer block before parsing the markdown body. The
+    # trailer is a sidecar of per-section state -- it's not part of
+    # the prose. Even if the file has no trailer, strip_trailer is a
+    # no-op and returns (text, None).
+    text, trailer_json = strip_trailer(raw_text)
+    parsed_trailer = parse_trailer(trailer_json) if trailer_json else None
     parsed_sections = parse_markdown(text)
 
     root = find_helper_root()
@@ -135,14 +142,19 @@ def cmd_open(args: argparse.Namespace) -> int:
             db_path, parsed_sections, filename, args, resolved,
             requested_schema=requested_schema,
             root=root, workspace_key=workspace_key,
+            parsed_trailer=parsed_trailer,
         )
 
     if args.reset:
         return _reset_open(
             db_path, parsed_sections, filename, args, resolved,
             requested_schema=requested_schema,
+            parsed_trailer=parsed_trailer,
         )
 
+    # Reconcile path intentionally does NOT apply the trailer -- the
+    # workspace's state is the source of truth on reopen. Re-applying
+    # the trailer would clobber in-flight work.
     return _reconcile_open(
         db_path, parsed_sections, filename, args, resolved,
     )
@@ -213,7 +225,7 @@ def _build_response_skeleton(
         "fileOnDisk": True,
         "sectionCount": len(sections_out),
         "sections": sections_out,
-        "schema": list(get_schema(conn).names()),
+        "schema": get_schema(conn).to_response(),
     }
     if foreign:
         response["readOnly"] = True
@@ -238,10 +250,26 @@ def _fresh_open(
     db_path, parsed_sections, filename, args, resolved, *,
     requested_schema: Schema | None,
     root, workspace_key,
+    parsed_trailer: dict | None = None,
 ) -> int:
     foreign = resolved.is_foreign
-    schema = requested_schema if requested_schema is not None else Schema.default()
 
+    # Schema priority order:
+    #   1. agent-provided --states-json (requested_schema)
+    #   2. schema embedded in the trailer (if present)
+    #   3. default ([pending, done])
+    schema: Schema
+    if requested_schema is not None:
+        schema = requested_schema
+    elif parsed_trailer and parsed_trailer.get("schema"):
+        try:
+            schema = Schema.from_param(parsed_trailer["schema"])
+        except ValueError:
+            schema = Schema.default()
+    else:
+        schema = Schema.default()
+
+    orphans: list[dict] = []
     with open_db(db_path) as conn:
         meta_set(conn, "createdAt", str(now()))
         meta_set(conn, c.META_FOREIGN, "1" if foreign else "0")
@@ -249,6 +277,13 @@ def _fresh_open(
             meta_set(conn, "foreignSource", str(resolved.disk_path))
         set_schema(conn, schema)
         _ingest_disk_into_workspace(conn, parsed_sections, foreign=foreign)
+        # Apply trailer overrides (state/seed/tags + archived subtrees).
+        # Foreign workspaces still benefit -- the trailer round-trips
+        # information that's gone from the visible doc.
+        if parsed_trailer is not None:
+            orphans = apply_trailer(
+                conn, parsed_trailer, schema=schema, now_ts=now(),
+            )
         # File on disk IS the source of truth right now.
         meta_set(conn, "last_saved_at", str(now()))
 
@@ -257,6 +292,8 @@ def _fresh_open(
         )
         response["reloaded"] = False
         response["fromDisk"] = True
+        if orphans:
+            response["trailerOrphans"] = orphans
 
     # If we were tracking this file as touch-only, drop that marker --
     # the workspace promotion supersedes it.
@@ -282,9 +319,21 @@ def _fresh_open(
 def _reset_open(
     db_path, parsed_sections, filename, args, resolved, *,
     requested_schema: Schema | None,
+    parsed_trailer: dict | None = None,
 ) -> int:
     foreign = resolved.is_foreign
 
+    # Schema for the reset workspace. If the agent explicitly passed
+    # one, that wins. Otherwise honor the trailer-embedded schema.
+    # Otherwise keep whatever the existing workspace had.
+    trailer_schema: Schema | None = None
+    if parsed_trailer and parsed_trailer.get("schema"):
+        try:
+            trailer_schema = Schema.from_param(parsed_trailer["schema"])
+        except ValueError:
+            trailer_schema = None
+
+    orphans: list[dict] = []
     with open_db(db_path) as conn:
         # Wipe sections + revisions + assistants. Keep meta (createdAt,
         # foreign flag) BUT honor a new schema if the agent passed one.
@@ -293,11 +342,19 @@ def _reset_open(
         conn.execute("DELETE FROM sections")
         if requested_schema is not None:
             set_schema(conn, requested_schema)
+        elif trailer_schema is not None:
+            set_schema(conn, trailer_schema)
         meta_set(conn, c.META_FOREIGN, "1" if foreign else "0")
         if foreign:
             meta_set(conn, "foreignSource", str(resolved.disk_path))
 
         _ingest_disk_into_workspace(conn, parsed_sections, foreign=foreign)
+        # Apply trailer same as fresh open.
+        schema_for_trailer = get_schema(conn)
+        if parsed_trailer is not None:
+            orphans = apply_trailer(
+                conn, parsed_trailer, schema=schema_for_trailer, now_ts=now(),
+            )
         meta_set(conn, "last_saved_at", str(now()))
 
         schema = get_schema(conn)
@@ -306,6 +363,8 @@ def _reset_open(
         )
         response["reloaded"] = True
         response["fromDisk"] = True
+        if orphans:
+            response["trailerOrphans"] = orphans
 
     if foreign:
         response["nextSteps"] = _foreign_next_steps(filename)

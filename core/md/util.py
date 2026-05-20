@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 
 
@@ -15,6 +16,86 @@ def count_words(s: str | None) -> int:
     if not s:
         return 0
     return len(s.split())
+
+
+# ---------------------------------------------------------------------------
+# Tags
+# ---------------------------------------------------------------------------
+
+MAX_TAG_LENGTH = 50
+_TAG_BAD_CHARS = set(" \t\n\r")
+
+
+def normalize_tags(tags) -> list[str]:
+    """Validate and normalize a list of tags. Returns a sorted, de-
+    duplicated list of lowercase tag strings.
+
+    Rules:
+      - None / empty list -> [] (clears tags).
+      - Each tag must be a non-empty string.
+      - Whitespace inside a tag is rejected (tags are identifiers, not
+        free-form notes).
+      - Tags longer than MAX_TAG_LENGTH are rejected.
+      - Tags are lowercased so "Billing" and "billing" collapse.
+      - Order is normalized to sorted ascending (tags are a SET; agents
+        shouldn't have to think about order when comparing).
+      - Duplicates are silently collapsed.
+
+    Replace semantics (consistent with how content/state work): passing
+    `tags=[...]` always REPLACES the section's full tag list. To merge,
+    callers must read existing tags first, union, then write.
+
+    Raises ValueError on any validation failure with a message naming
+    the offending tag.
+    """
+    if tags is None:
+        return []
+    if not isinstance(tags, list):
+        raise ValueError(f"tags must be a list, got {type(tags).__name__}")
+    seen: set[str] = set()
+    for t in tags:
+        if not isinstance(t, str):
+            raise ValueError(
+                f"tags must be strings, got {type(t).__name__}: {t!r}"
+            )
+        if not t:
+            raise ValueError("tags may not be empty strings")
+        if any(ch in _TAG_BAD_CHARS for ch in t):
+            raise ValueError(
+                f"tag {t!r} contains whitespace; tags are identifiers, "
+                f"not free-form notes"
+            )
+        if len(t) > MAX_TAG_LENGTH:
+            raise ValueError(
+                f"tag {t!r} exceeds {MAX_TAG_LENGTH} characters"
+            )
+        seen.add(t.lower())
+    return sorted(seen)
+
+
+def tags_to_json(tags: list[str]) -> str | None:
+    """Serialize a tag list to the storage form (JSON text). Returns
+    None for the empty case so the column stores NULL instead of '[]'.
+    """
+    if not tags:
+        return None
+    return json.dumps(tags)
+
+
+def tags_from_json(text) -> list[str]:
+    """Deserialize from storage. Tolerant of None / empty string /
+    '[]' / malformed JSON (returns [] in degenerate cases)."""
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    # Trust the writer (normalize_tags) ran, but defensively drop any
+    # non-string entries that snuck in.
+    return [t for t in parsed if isinstance(t, str)]
 
 
 def maybe_unescape_literal_newlines(content: str | None) -> tuple[str | None, bool]:

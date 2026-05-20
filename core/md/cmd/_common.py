@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sqlite3
 import sys
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ from ..sections import (
     fetch_all_sections_in_order,
     fetch_section,
     section_depth,
+    update_section_content,
 )
 from ..states import (
     PSEUDO_STATES,
@@ -159,6 +161,10 @@ def resolve_section_or_die(
 ) -> str | None:
     """Resolve an agent-supplied sectionNumber to a UUID, or print an
     error and return None.
+
+    Strict: only accepts section-number form ("A", "A.1.2", "0"). For
+    insert/move position targets that should also accept titles, use
+    resolve_section_handle.
     """
     if not section_number:
         emit_error({"error": "sectionNumber is required (e.g. 'A.1.2', 'B', '0')"})
@@ -175,6 +181,166 @@ def resolve_section_or_die(
         })
         return None
     return uuid
+
+
+def resolve_section_handle(
+    conn: sqlite3.Connection,
+    handle: str,
+    *,
+    parent_scope: str | None = None,
+    arg_name: str = "target",
+) -> str | None:
+    """Resolve a position-target HANDLE to a UUID.
+
+    The handle is whatever the agent typed for `before` / `after` /
+    `under`. We try in this order:
+
+      1. Section-number form ("A", "A.1.2", "0") -- exact address.
+      2. Exact title match -- the natural form when sections are
+         being referred to by name (which is more stable than numbers
+         after structural mutations).
+
+    Title-resolution semantics:
+      - Match is case-sensitive and exact (no substring).
+      - If multiple sections share the title, errors with a list of
+        candidates (sectionNumber + parent title for context) and a
+        hint to narrow via `parentSection: <sectionNumber>`.
+      - `parent_scope` (a section-number) restricts the search to the
+        named section's subtree (its descendants + itself, but a
+        target IS the parent itself is rejected -- that would never
+        be useful for an insert/move position).
+
+    Returns the UUID, or None after emitting an error.
+    """
+    if not handle:
+        emit_error({"error": f"{arg_name} is required"})
+        return None
+
+    # Pass 1: try section-number form. The address grammar is strict
+    # (letters + dots), so a typo like "Active execution tracker"
+    # raises ValueError; we swallow that and fall through to title.
+    try:
+        uuid_by_number = resolve_section_number(conn, handle)
+        if uuid_by_number is not None:
+            return uuid_by_number
+    except ValueError:
+        pass
+
+    # Pass 2: title-resolution.
+    if parent_scope:
+        # Resolve parent_scope the same way -- accept sectionNumber OR
+        # exact title. R1 says titles are stable, so agents will type
+        # `parentSection: "Alpha"` not `parentSection: "A.1"`. Number
+        # first, then title. Ambiguous parent title is a real error
+        # (pick an unambiguous ancestor).
+        scope_uuid: str | None = None
+        try:
+            scope_uuid = resolve_section_number(conn, parent_scope)
+        except ValueError:
+            pass
+        if scope_uuid is None:
+            scope_rows = conn.execute(
+                "SELECT id FROM sections WHERE title = ?", (parent_scope,),
+            ).fetchall()
+            if len(scope_rows) == 1:
+                scope_uuid = scope_rows[0]["id"]
+            elif len(scope_rows) > 1:
+                emit_error({
+                    "error": f"parentSection {parent_scope!r} matches "
+                             f"{len(scope_rows)} sections; ambiguous",
+                    "hint": "Use a sectionNumber for parentSection, "
+                            "or pick an unambiguous ancestor title.",
+                })
+                return None
+        if scope_uuid is None:
+            emit_error({
+                "error": f"parentSection {parent_scope!r} not found "
+                         f"(tried sectionNumber AND title)",
+                "hint": "Use markdown_outline to see current section "
+                        "titles and numbers.",
+            })
+            return None
+        # Walk descendants of scope_uuid and collect title matches.
+        candidates = _find_title_in_subtree(conn, scope_uuid, handle)
+    else:
+        # Global title search.
+        rows = conn.execute(
+            "SELECT id FROM sections WHERE title = ?",
+            (handle,),
+        ).fetchall()
+        candidates = [r["id"] for r in rows]
+
+    if len(candidates) == 1:
+        return candidates[0]
+
+    if not candidates:
+        scope_phrase = f" in subtree of {parent_scope!r}" if parent_scope else ""
+        emit_error({
+            "error": f"no section{scope_phrase} with title {handle!r} (and not a valid sectionNumber either)",
+            "hint": "Titles are matched exactly (case-sensitive). "
+                    "Use markdown_outline to see current titles, or pass a "
+                    "sectionNumber like 'A' / 'A.1.2'.",
+        })
+        return None
+
+    # Ambiguity: build a candidates list with each section's address +
+    # its parent's title (so the agent can pick by context).
+    cand_details = []
+    for uuid in candidates:
+        addr = compute_section_number(conn, uuid)
+        row = conn.execute(
+            "SELECT s.title AS title, p.id AS parent_id, p.title AS parent_title "
+            "FROM sections s LEFT JOIN sections p ON s.parent_id = p.id "
+            "WHERE s.id = ?",
+            (uuid,),
+        ).fetchone()
+        parent_sn: str | None = None
+        if row and row["parent_id"]:
+            parent_sn = compute_section_number(conn, row["parent_id"]).display
+        cand_details.append({
+            "sectionNumber": addr.display,
+            "title": row["title"] if row else handle,
+            "parentSectionNumber": parent_sn,
+            "parentTitle": row["parent_title"] if row else None,
+        })
+
+    emit_error({
+        "error": f"title {handle!r} matches {len(candidates)} sections; ambiguous",
+        "candidates": cand_details,
+        "hint": "Narrow with parentSection: <sectionNumber> (use one of "
+                f"the parentSectionNumber values above), or pass an "
+                f"exact sectionNumber like 'A.1.2'.",
+    })
+    return None
+
+
+def _find_title_in_subtree(
+    conn: sqlite3.Connection,
+    scope_uuid: str,
+    title: str,
+) -> list[str]:
+    """Return UUIDs of sections under `scope_uuid` (descendants only,
+    not the scope itself) whose title matches `title` exactly."""
+    # BFS by parent_id.
+    out: list[str] = []
+    frontier = [scope_uuid]
+    visited: set[str] = set()
+    while frontier:
+        nxt: list[str] = []
+        for pid in frontier:
+            if pid in visited:
+                continue
+            visited.add(pid)
+            rows = conn.execute(
+                "SELECT id, title FROM sections WHERE parent_id = ?",
+                (pid,),
+            ).fetchall()
+            for r in rows:
+                if r["title"] == title:
+                    out.append(r["id"])
+                nxt.append(r["id"])
+        frontier = nxt
+    return out
 
 
 def refuse_readonly_section_or_die(sec: SectionRow, section_number: str) -> bool:
@@ -207,7 +373,7 @@ def summarize_section(
     """Build the agent-visible JSON shape for a section.
 
     Includes sectionNumber (computed from chain position), title, state,
-    word count, and seed. Optionally includes content (used by
+    word count, seed, and tags. Optionally includes content (used by
     markdown_get).
     """
     addr = compute_section_number(conn, sec.id)
@@ -221,6 +387,8 @@ def summarize_section(
     }
     if sec.seed is not None:
         out["seed"] = sec.seed
+    if sec.tags:
+        out["tags"] = sec.tags
     if sec.session_id:
         out["sessionId"] = sec.session_id
     if sec.updated_at:
@@ -256,10 +424,21 @@ def save_nudge_step(staleness: dict[str, Any], filename: str) -> str | None:
     if not staleness.get("needsSave"):
         return None
     n = staleness["sectionsChangedSinceSave"]
-    plural = "section" if n == 1 else "sections"
+    plural = "section has" if n == 1 else "sections have"
+    last_ts = staleness.get("lastSavedAt")
+    if last_ts:
+        age_s = max(0, now() - int(last_ts))
+        if age_s < 60:
+            age_phrase = f"last save was {age_s}s ago"
+        elif age_s < 3600:
+            age_phrase = f"last save was {age_s // 60}m ago"
+        else:
+            age_phrase = f"last save was {age_s // 3600}h{(age_s % 3600) // 60}m ago"
+    else:
+        age_phrase = "never saved yet"
     return (
-        f"{n} {plural} updated since the last save. "
-        f"Call markdown_save {{ filename: {filename!r} }} to write to the file."
+        f"{n} {plural} changed since last save ({age_phrase}). "
+        f"Call markdown_save {{ filename: {filename!r} }} to flush to disk."
     )
 
 
@@ -342,34 +521,219 @@ def take_outline_snapshot(conn: sqlite3.Connection) -> list[OutlineEntry]:
     return out
 
 
-def outline_summary(snapshot: list[OutlineEntry]) -> list[dict[str, Any]]:
-    """Compact post-mutation outline for inclusion in mutation responses.
-
-    Each entry carries sectionNumber, depth, title, wordCount -- enough
-    for an agent to re-plan against shifted addresses without a separate
-    markdown_outline call. Note: NO state/seed -- this is a structural
-    snapshot, not a workspace view.
-    """
-    return [
-        {
-            "sectionNumber": e.sectionNumber,
-            "depth": e.depth,
-            "title": e.title,
-            "wordCount": e.wordCount,
-        }
-        for e in snapshot
-    ]
-
-
 # Threshold above which `shifted` is omitted in favor of just the
 # outline. Keeps the response from drowning in shift mappings.
 MAX_SHIFTED_IN_REPORT = 5
+
+
+# ---------------------------------------------------------------------------
+# §-reference auto-rewrite
+# ---------------------------------------------------------------------------
+#
+# When a structural mutation shifts section numbers (B -> C, B.1 -> C.1,
+# etc), any cross-reference in the body of any OTHER section that wrote
+# the old number as `§B.1` goes stale. Agents hate this -- they spend
+# turns chasing down stale references after every insert/move/delete.
+#
+# Solution: after a mutation, scan every section's body for `§<old>`
+# tokens that match a shift in the changeReport, and rewrite them to
+# `§<new>`. Two-pass with sentinels to handle chained collisions
+# (e.g. C.1 -> D.1 must not get re-rewritten by the D.1 -> E.1 pass).
+#
+# Reference syntax recognised:
+#   §A          top-level letter
+#   §B.1        depth-2
+#   §B.1.2.3    arbitrarily deep
+#   §0          the headless preamble
+# A trailing word-boundary keeps `§B.1` from gobbling `§B.10` and
+# vice versa.
+#
+# Skipped contexts:
+#   - fenced code blocks (``` and ~~~): treated as quoted material;
+#     leave the literal text intact. Agents quote source / examples
+#     inside fences and rewriting them would corrupt the quote.
+#   - HTML comments (<!-- ... -->): the trailer block lives in an
+#     HTML comment at end-of-file, but per-section bodies generally
+#     don't carry them; still, treat as opaque to be safe.
+#
+# Inline code spans (`§B.1`) ARE rewritten -- backticks-in-prose
+# represent a typographically emphasised live reference, not quoted
+# material.
+#
+# The regex below intentionally matches `§<id>` ONLY, not bare `B.1`
+# tokens. The guide instructs agents to use the §-sigil for any
+# section reference in persistent content; bare tokens are agent's
+# responsibility (they might be version numbers, file paths, etc).
+
+# Matches §<id> where <id> is either "0" or one uppercase letter
+# optionally followed by .N segments. Letter case is restricted to
+# A-Z because top-level letters come from _letter_for_index().
+_REF_PATTERN = re.compile(
+    r"§(?P<id>0|[A-Z](?:\.\d+)*)(?=\W|$)",
+)
+
+# Matches a fenced code block (``` or ~~~ on its own line, span until
+# the matching closing fence). DOTALL because fences span newlines.
+# Non-greedy so adjacent fences don't get merged. Anchored to line
+# start for the opening fence to avoid matching ``` inside prose.
+_FENCE_PATTERN = re.compile(
+    r"(?ms)^(?P<fence>```|~~~)[^\n]*\n.*?^(?P=fence)\s*$",
+)
+
+
+def _mask_fences(text: str) -> tuple[str, list[str]]:
+    """Replace fenced code blocks with sentinel tokens.
+
+    Returns (masked_text, originals). Apply the rewrite to
+    masked_text, then unmask via _unmask_fences(result, originals).
+    """
+    originals: list[str] = []
+
+    def _repl(m: re.Match[str]) -> str:
+        idx = len(originals)
+        originals.append(m.group(0))
+        return f"\x00MDH_FENCE_{idx}\x00"
+
+    masked = _FENCE_PATTERN.sub(_repl, text)
+    return masked, originals
+
+
+def _unmask_fences(text: str, originals: list[str]) -> str:
+    """Restore fenced code blocks from sentinel tokens."""
+    for idx, original in enumerate(originals):
+        text = text.replace(f"\x00MDH_FENCE_{idx}\x00", original)
+    return text
+
+
+def rewrite_section_references(
+    text: str,
+    shift_map: dict[str, str],
+) -> tuple[str, int]:
+    """Apply a §<from> -> §<to> rewrite to `text`.
+
+    `shift_map` is a {from_id: to_id} mapping built from the
+    changeReport's `shifted` array. Returns (new_text, count) where
+    count is the number of references rewritten.
+
+    Two-pass with sentinels handles chained collisions: when a
+    cascade shifts `C.1 -> D.1` and `D.1 -> E.1`, naive sequential
+    replacement would rewrite `§C.1` to `§D.1` then to `§E.1`. The
+    sentinel pass replaces all matches with unique tokens first,
+    then resolves tokens to final values.
+
+    Fenced code blocks are masked before the rewrite and restored
+    after -- quoted source / examples stay byte-identical.
+
+    `shift_map` may include identity entries (from == to); those
+    are filtered out before processing so the regex doesn't waste
+    work on them.
+    """
+    if not shift_map:
+        return text, 0
+
+    # Filter identity entries -- a shift map computed by some other
+    # code path may include "no-op" rows. Pass-through cleanly.
+    real_shifts = {k: v for k, v in shift_map.items() if k != v}
+    if not real_shifts:
+        return text, 0
+
+    masked, fence_originals = _mask_fences(text)
+
+    # Pass 1: replace every §<id> match whose id is in shift_map with
+    # a unique sentinel. Build a parallel list of replacements indexed
+    # by sentinel number.
+    replacements: list[str] = []
+
+    def _to_sentinel(m: re.Match[str]) -> str:
+        ref_id = m.group("id")
+        if ref_id not in real_shifts:
+            return m.group(0)  # not shifted, leave alone
+        idx = len(replacements)
+        replacements.append(f"§{real_shifts[ref_id]}")
+        return f"\x00MDH_REF_{idx}\x00"
+
+    sentinel_text = _REF_PATTERN.sub(_to_sentinel, masked)
+
+    if not replacements:
+        # Nothing matched -- skip pass 2, return original masked text
+        # restored (no work needed).
+        return _unmask_fences(sentinel_text, fence_originals), 0
+
+    # Pass 2: replace sentinels with their final §<new> values.
+    for idx, value in enumerate(replacements):
+        sentinel_text = sentinel_text.replace(
+            f"\x00MDH_REF_{idx}\x00", value,
+        )
+
+    return _unmask_fences(sentinel_text, fence_originals), len(replacements)
+
+
+def apply_reference_rewrites(
+    conn: sqlite3.Connection,
+    shifted: list[dict[str, Any]],
+    *,
+    by: str | None = None,
+) -> dict[str, Any]:
+    """Walk every section's body and rewrite §-refs per the shift map.
+
+    Returns a summary dict:
+        {
+            "rewriteCount": <total refs rewritten across all sections>,
+            "sectionsTouched": <count of sections whose body changed>,
+        }
+
+    If `shifted` is empty or contains only identity rows, returns
+    zero counts and does not touch the DB. Callers can omit the
+    summary from the response when both counts are zero.
+
+    Updates go through update_section_content so word_count + audit
+    fields stay consistent. `by` defaults to "ref-rewrite" so the
+    revision history makes the source obvious.
+    """
+    if not shifted:
+        return {"rewriteCount": 0, "sectionsTouched": 0}
+
+    shift_map = {item["from"]: item["to"] for item in shifted
+                 if item.get("from") and item.get("to")}
+    if not shift_map:
+        return {"rewriteCount": 0, "sectionsTouched": 0}
+
+    total_rewrites = 0
+    sections_touched = 0
+    timestamp = now()
+    actor = by or "ref-rewrite"
+
+    for sec in fetch_all_sections_in_order(conn):
+        body = sec.content or ""
+        if not body:
+            continue
+        new_body, count = rewrite_section_references(body, shift_map)
+        if count == 0 or new_body == body:
+            continue
+        update_section_content(
+            conn,
+            sec.id,
+            content=new_body,
+            updated_by=actor,
+            session_id=None,
+            now=timestamp,
+        )
+        total_rewrites += count
+        sections_touched += 1
+
+    return {
+        "rewriteCount": total_rewrites,
+        "sectionsTouched": sections_touched,
+    }
 
 
 def compute_change_report(
     before: list[OutlineEntry],
     after: list[OutlineEntry],
     filename: str,
+    *,
+    conn: sqlite3.Connection | None = None,
+    by: str | None = None,
 ) -> dict[str, Any]:
     """Diff two outline snapshots into the standard changeReport shape.
 
@@ -444,13 +808,32 @@ def compute_change_report(
     else:
         change_report["shiftedCount"] = len(shifted)
 
+    # Auto-rewrite §-references across every section's body when
+    # sections shifted. The conn parameter is optional for backward
+    # compat with callers that haven't been updated yet (or unit
+    # tests that diff snapshots without a DB), but every real
+    # mutation command should pass it. The rewrite is a no-op when
+    # `shifted` is empty.
+    ref_rewrite: dict[str, Any] | None = None
+    if conn is not None and shifted:
+        rw = apply_reference_rewrites(conn, shifted, by=by)
+        if rw["rewriteCount"] > 0:
+            change_report["referenceRewrites"] = rw
+            ref_rewrite = rw
+
     user_summary = _render_user_summary(
         filename, inserted, deleted, shifted, modified,
+        ref_rewrite=ref_rewrite,
     )
+    # NB: the full post-mutation outline used to be returned here in
+    # `outline`. It was dropped because (a) on docs with hundreds of
+    # sections it blew past tool-output caps and got truncated,
+    # (b) the changeReport already tells the agent what shifted, and
+    # (c) the agent can call markdown_outline explicitly when they
+    # need to re-plan against the post-state.
     return {
         "changeReport": change_report,
         "userSummary": user_summary,
-        "outline": outline_summary(after),
     }
 
 
@@ -460,6 +843,8 @@ def _render_user_summary(
     deleted: list[dict[str, Any]],
     shifted: list[dict[str, Any]],
     modified: list[dict[str, Any]],
+    *,
+    ref_rewrite: dict[str, Any] | None = None,
 ) -> str:
     """Render the changeReport as a multi-line human-readable string.
 
@@ -469,6 +854,13 @@ def _render_user_summary(
         - <sn> "<title>"
         ~ <from> -> <to> "<title>"
         * <sn>  (+N words)
+        > N section references auto-updated across M sections
+
+    The trailing `>` line is added when ref_rewrite is non-empty
+    (i.e. one or more body cross-references were rewritten to track
+    a section shift). Agents should treat it as "section references
+    in any other section's body were updated to match the new
+    addresses; you do not need to touch them".
 
     If there are no changes, returns "<filename>:\n  (no changes)".
     """
@@ -499,6 +891,16 @@ def _render_user_summary(
         delta = item["wordDelta"]
         sign = "+" if delta >= 0 else ""
         lines.append(f'  * {item["sectionNumber"]}  ({sign}{delta} words)')
+
+    if ref_rewrite and ref_rewrite.get("rewriteCount", 0) > 0:
+        any_change = True
+        rc = ref_rewrite["rewriteCount"]
+        st = ref_rewrite["sectionsTouched"]
+        ref_word = "reference" if rc == 1 else "references"
+        sec_word = "section" if st == 1 else "sections"
+        lines.append(
+            f'  > {rc} \u00a7-{ref_word} auto-updated across {st} {sec_word}'
+        )
 
     if not any_change:
         lines.append("  (no changes)")
@@ -537,6 +939,8 @@ __all__ = [
     "OutlineEntry",
     "take_outline_snapshot",
     "compute_change_report",
+    "rewrite_section_references",
+    "apply_reference_rewrites",
     "collect_state_counts_from_workspace",
     "now",
     "file_db_path",

@@ -37,7 +37,7 @@ from ..sections import (
 )
 from ..states import STATE_READONLY
 from ..storage import open_db
-from ..util import maybe_unescape_literal_newlines, now
+from ..util import maybe_unescape_literal_newlines, normalize_tags, now
 
 
 def register_parser(sub) -> None:
@@ -46,13 +46,24 @@ def register_parser(sub) -> None:
     p.add_argument("--filename", required=True)
     grp = p.add_mutually_exclusive_group(required=True)
     grp.add_argument("--before",
-                     help="sectionNumber to insert just before (same parent)")
+                     help="sectionNumber OR title to insert just before "
+                          "(same parent). Title-resolution is global by "
+                          "default; pass --parent-section to scope.")
     grp.add_argument("--after",
-                     help="sectionNumber to insert just after (same parent)")
+                     help="sectionNumber OR title to insert just after "
+                          "(same parent). Title-resolution is global by "
+                          "default; pass --parent-section to scope.")
     grp.add_argument("--under",
-                     help="sectionNumber to insert as last child of")
+                     help="sectionNumber OR title to insert as last child "
+                          "of. Title-resolution is global by default; pass "
+                          "--parent-section to scope.")
     grp.add_argument("--top-level", action="store_true",
                      help="append as new top-level section (last in forest)")
+    p.add_argument("--parent-section",
+                   help="when --before/--after/--under is a title, scope "
+                        "the title search to the named section's subtree. "
+                        "Use to disambiguate when multiple sections share "
+                        "a title.")
     p.add_argument("--title",
                    help="heading text. Omit for headless preamble (top-level only).")
     p.add_argument("--seed",
@@ -64,6 +75,10 @@ def register_parser(sub) -> None:
                         "subtree: parse content; headings auto-split into descendants.")
     p.add_argument("--state",
                    help="initial state (default: schema's initial state)")
+    p.add_argument("--tags",
+                   help="JSON array of identifier-style tags for the new "
+                        "section, e.g. '[\"billing\",\"v1\"]'. Lowercase- "
+                        "normalized; whitespace inside a tag is rejected.")
     p.add_argument("--by", help="writer identifier; defaults to 'primary'")
     c.add_pretty(p)
     p.set_defaults(func=cmd_insert)
@@ -92,6 +107,22 @@ def cmd_insert(args: argparse.Namespace) -> int:
 
     title = args.title if args.title else None
 
+    # Parse + validate tags up-front so we fail before the workspace is
+    # touched.
+    tags: list[str] = []
+    if args.tags is not None:
+        import json
+        try:
+            tags_raw = json.loads(args.tags)
+        except json.JSONDecodeError as e:
+            c.emit_error({"error": f"--tags must be a JSON array: {e}"})
+            return 2
+        try:
+            tags = normalize_tags(tags_raw)
+        except ValueError as e:
+            c.emit_error({"error": str(e)})
+            return 2
+
     with open_db(ws_dir / "db.sqlite3") as conn:
         schema = c.schema_or_die(conn)
 
@@ -105,20 +136,28 @@ def cmd_insert(args: argparse.Namespace) -> int:
         target_uuid: str | None = None
         position_kwargs: dict = {}
 
+        parent_scope = args.parent_section
+
         if args.top_level:
             position_kwargs = {"at_top_level": True}
         elif args.before:
-            target_uuid = c.resolve_section_or_die(conn, args.before)
+            target_uuid = c.resolve_section_handle(
+                conn, args.before, parent_scope=parent_scope, arg_name="before",
+            )
             if target_uuid is None:
                 return 1
             position_kwargs = {"before": target_uuid}
         elif args.after:
-            target_uuid = c.resolve_section_or_die(conn, args.after)
+            target_uuid = c.resolve_section_handle(
+                conn, args.after, parent_scope=parent_scope, arg_name="after",
+            )
             if target_uuid is None:
                 return 1
             position_kwargs = {"after": target_uuid}
         elif args.under:
-            target_uuid = c.resolve_section_or_die(conn, args.under)
+            target_uuid = c.resolve_section_handle(
+                conn, args.under, parent_scope=parent_scope, arg_name="under",
+            )
             if target_uuid is None:
                 return 1
             position_kwargs = {"under": target_uuid}
@@ -151,7 +190,8 @@ def cmd_insert(args: argparse.Namespace) -> int:
 
         if args.mode == "subtree" and content:
             # Subtree: insert the section first (with body=None), then
-            # splice the parsed children into it.
+            # splice the parsed children into it. Tags only attach to
+            # the OUTER new section -- auto-split children aren't tagged.
             new_section = insert_section(
                 conn,
                 parent_id=parent_id,
@@ -162,6 +202,7 @@ def cmd_insert(args: argparse.Namespace) -> int:
                 state=state,
                 updated_by=args.by or "primary",
                 now=now(),
+                tags=tags or None,
             )
             depth = section_depth(conn, new_section.id)
             body, child_specs = parse_markdown_to_subtree(content, target_depth=depth)
@@ -186,18 +227,57 @@ def cmd_insert(args: argparse.Namespace) -> int:
                 state=state,
                 updated_by=args.by or "primary",
                 now=now(),
+                tags=tags or None,
             )
 
         new_addr = compute_section_number(conn, new_section.id)
         after_snapshot = c.take_outline_snapshot(conn)
-        report = c.compute_change_report(before_snapshot, after_snapshot, filename)
+        report = c.compute_change_report(
+            before_snapshot, after_snapshot, filename,
+            conn=conn, by=args.by or "primary",
+        )
+
+        # Count post-mutation top-level titled sections so we can emit
+        # the "letter-jumping hint" below. We also surface the new
+        # section's NEIGHBORING top-level entries so the agent can see
+        # the local context if the assigned letter surprised them.
+        top_level_entries = [e for e in after_snapshot
+                             if e.depth == 1 and e.title is not None]
+        top_level_count = len(top_level_entries)
 
     response: dict = {
         "filename": filename,
         "sectionNumber": new_addr.display,
         "changeReport": report["changeReport"],
         "userSummary": report["userSummary"],
-        "outline": report["outline"],
     }
+
+    # Item #3 hint: when an agent uses `topLevel: true` on a doc that
+    # has accumulated many top-level sections, the assigned letter
+    # may be "far ahead" of where the agent expected (T appears, agent
+    # inserts topLevel, gets X because U, V, W were already taken).
+    # The hint surfaces the alternative -- anchor with `after:` for
+    # predictable letter assignment.
+    if args.top_level and top_level_count >= 20:
+        # Show the agent the prior top-level (the one that was the last
+        # before the insert) so they can pick a meaningful anchor next
+        # time. The just-inserted section IS the last; the one before
+        # is at index -2.
+        prior: str | None = None
+        if len(top_level_entries) >= 2:
+            prior_entry = top_level_entries[-2]
+            prior = prior_entry.title or prior_entry.sectionNumber
+        anchor_hint = (
+            f"`after: {prior!r}`" if prior
+            else "`after: '<title-or-sectionNumber>'`"
+        )
+        response.setdefault("nextSteps", []).append(
+            f"This doc now has {top_level_count} top-level sections. "
+            f"`topLevel: true` appends to the END of the forest, which "
+            f"may put the new letter far from what you expected. "
+            f"To anchor the next insert deterministically, use "
+            f"{anchor_hint} (or `before:`) instead of `topLevel: true`."
+        )
+
     c.emit(response, args.pretty)
     return 0

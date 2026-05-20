@@ -321,13 +321,18 @@ def cmd_discover(args: argparse.Namespace) -> int:
         "matchedCount": len(matched),
         "matched": matched,
         "workspaceMatches": workspace_matches,
-        "nextSteps": _next_steps(matched, workspace_matches),
+        "nextSteps": _next_steps(matched, workspace_matches, pattern=args.filename),
     }
     c.emit(response, args.pretty)
     return 0
 
 
-def _next_steps(matched: list[dict], workspace_matches: list[dict]) -> list[str]:
+def _next_steps(
+    matched: list[dict],
+    workspace_matches: list[dict],
+    *,
+    pattern: str | None = None,
+) -> list[str]:
     out: list[str] = []
     if matched:
         first = matched[0]["filename"]
@@ -344,6 +349,23 @@ def _next_steps(matched: list[dict], workspace_matches: list[dict]) -> list[str]
             f"bottom (open or touched files not under the search dir)."
         )
     if not matched and not workspace_matches:
-        out.append("No matches. Try widening with recursive=true or a "
-                   "different filename pattern.")
+        # Bare-word patterns (no glob metacharacters, no /.../ wrapping)
+        # become exact-match globs which surprises agents who expect
+        # substring semantics. Detect and call it out.
+        metachars = set(".^$*+?()[]{}|\\")
+        is_bare_word = (
+            bool(pattern)
+            and not (pattern.startswith("/") and pattern.endswith("/"))
+            and not any(ch in metachars for ch in pattern)
+        )
+        if is_bare_word:
+            out.append(
+                f"No matches. Note: filename={pattern!r} was treated as an "
+                f"EXACT-match glob (no wildcards). For substring matching, "
+                f"use a glob with wildcards (e.g. '*{pattern}*.md') or a "
+                f"regex (e.g. '/{pattern}/')."
+            )
+        else:
+            out.append("No matches. Try widening with recursive=true or a "
+                       "different filename pattern.")
     return out

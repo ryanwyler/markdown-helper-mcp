@@ -141,11 +141,12 @@ tree. UUIDs are internal; agents never see them.
 
 | Tool | Purpose |
 |---|---|
-| `markdown_outline` | Structure + state + save staleness. `filterStates: 'name1,name2'` filters by state. |
-| `markdown_read` | Sections + content. `format: 'structured'` (default) returns JSON; `format: 'markdown'` renders as a single string for patching. `scope: 'subtree'` includes descendants. Range spec like `'A.1,A.2-A.4'`. |
+| `markdown_outline` | Structure + state + save staleness. `filterStates` DSL: omit to exclude `loaded` + terminal states (default "live work" view); `'all'` for everything; `'a,b,c'` positive list; `'!loaded,!done'` negation. `titleContains` filters by case-insensitive title substring. `tagsContain` filters to sections carrying all listed tags. `format: 'compact'` returns single-line strings (~10x smaller). |
+| `markdown_read` | Sections + content. `format: 'structured'` (default) returns JSON; `format: 'markdown'` renders as a single string for patching. `scope: 'subtree'` includes descendants. Range spec like `'A.1,A.2-A.4'`. `assist: '<question>'` spawns a sub-agent that reads the file and answers with citations. |
 | `markdown_get` | One section + revision history (workspace only). |
 | `markdown_list` | Index of all open + touched files. With `filename`, returns full status of one file. `filterStates` filters at file level. |
 | `markdown_discover` | Find docs without opening. `dir`/`filename` (glob OR regex)/`recursive`/`limit`. Honors `.gitignore` by default; explicitly naming an ignored dir overrides. |
+| `markdown_search` | Regex grep over titles and/or bodies. `pattern` is a Python regex. `scope` is `'title'`, `'body'`, or `'title,body'` (default). Case-insensitive by default; `caseSensitive: true` to disable. Returns matches in document order with `before`/`after` context lines (default 2). Capped at 200 matches by default; raise `limit` or narrow the pattern. |
 
 **Write**
 
@@ -161,8 +162,9 @@ tree. UUIDs are internal; agents never see them.
 
 | Tool | Purpose |
 |---|---|
-| `markdown_dispatch` | Spawn (or `kill: true`) an opencode sub-agent on a section. Section transitions to schema's `working` state; `resultState` overrides. Reuses the section's prior session for revision loops. |
+| `markdown_dispatch` | Spawn (or `kill: true`) an opencode sub-agent on a section. Section transitions to schema's `working` state; `resultState` overrides. Reuses the section's prior session for revision loops. `extraInstructions` injects free-form text into the sub-agent's prompt. |
 | `markdown_review` | Transition a section to a chosen state. `toState: '<name>'` for explicit; `action: 'accept'` maps to schema's terminal state; `action: 'reject'` maps to needsAttention state (requires `notes`). |
+| `markdown_tag` | Edit a section's tags without rewriting the body. Pick exactly one of `set: [...]` (replace), `add: [...]` (union), or `remove: [...]` (set diff). Single-section or `writes:[...]` batch. No content required, no force gate, no section-number shift. No-op writes are detected and skipped so revision history stays meaningful. |
 | `markdown_guide` | Returns the agent guide. |
 
 **Standard mutation response**: `set`/`insert`/`delete`/`move`/`patch`
@@ -256,6 +258,70 @@ or sees it -- they always use the absolute realpath
   `ext/` is rejected, so foreign and local workspaces can never
   collide in the same `<dir>` subtree.
 
+### Tags
+
+Tags are an **orthogonal axis** to state and content. State tracks
+pipeline position (`pending -> in-progress -> done`); tags track
+topic, ownership, or any other free-form labeling
+(`billing`, `urgent`, `api`, `bug`). A section can carry any number
+of tags; tags are lowercase-normalized identifiers (whitespace
+inside a tag is rejected).
+
+Three verbs touch tags:
+
+- **`markdown_tag`** is the dedicated tag-only verb (set/add/remove,
+  single or batch, no body rewrite).
+- **`markdown_set`** and **`markdown_insert`** accept an optional
+  `tags: [...]` field that replaces the section's tag set as part of
+  the same write.
+
+Tags are queryable via `markdown_outline tagsContain: 'a,b'`
+(returns sections that carry **all** listed tags). Combine with
+`filterStates` and `titleContains` for surgical scoreboards
+(`filterStates: 'in-progress,blocked'` + `tagsContain: 'billing'`).
+
+Tags are stored in the workspace's SQL `meta` and round-tripped
+through the trailer on save (see below), so they survive
+save+reopen.
+
+### Trailer block (round-trip metadata)
+
+Per-section state, seeds, and tags live in the workspace SQLite,
+not in the rendered markdown. To make the .md file
+**self-contained** -- so dropping the workspace cache (session
+compaction, fresh-cwd open, another agent picks up the doc weeks
+later) doesn't lose that metadata -- `markdown_save` appends an
+HTML comment block at the very end of the file:
+
+```html
+<!-- markdown-helper:v1
+{
+  "v": 1,
+  "sections": {
+    "A.1": {"state": "in-progress", "seed": "...", "tags": [...]},
+    "B.2": {"state": "blocked"}
+  },
+  "archived": [
+    {"parent": "A", "title": "Old approach", "body": "...",
+     "state": "archived", "children": [...]}
+  ]
+}
+-->
+```
+
+The comment is invisible in rendered markdown but parseable on
+reopen. `markdown_open` detects the trailer, parses it, and
+applies the metadata over the freshly-ingested workspace. Sections
+are keyed by `sectionNumber` (a snapshot of the structure at save
+time -- consistent because save renders the file AND writes the
+trailer in one operation).
+
+The trailer is opt-out via author edit (delete the comment and
+state/seeds/tags are lost on reopen, but the prose is intact) and
+gracefully no-ops on files that never had one. It's a thin,
+self-describing audit trail, not a replacement for the workspace
+DB (no revision history, no UUIDs).
+
 ### State machine
 
 States are agent-declared. The workspace's schema lives in the SQL
@@ -308,7 +374,17 @@ Role flags drive tool behavior:
 
 ### Editing model
 
-Three edit primitives, ordered by surface area:
+Sections are edited along **three orthogonal axes**:
+
+- **Body** (`markdown_set`, `markdown_insert`, `markdown_patch`) -- the prose.
+- **State** (`markdown_review`) -- the pipeline position.
+- **Tags** (`markdown_tag`) -- topic / ownership labels.
+
+Each verb touches one axis without disturbing the others (though
+`set`/`insert` accept optional `state` and `tags` fields to bundle
+axes in a single write).
+
+Three body-edit primitives, ordered by surface area:
 
 1. **`markdown_set`** -- whole-section rewrite. Default mode
    `body` replaces the section's body literally; mode `subtree`
@@ -423,26 +499,33 @@ markdown-helper/
       revisions.py        # revision history table
       states.py           # Schema dataclass; loaded/readonly pseudo-states;
                           # needs_force(); auto_transition()
-      util.py             # now(), count_words()
+      trailer.py          # round-trip metadata: HTML-comment trailer
+                          # carrying per-section state/seeds/tags + archived
+                          # subtrees, so the .md is self-describing
+      util.py             # now(), count_words(), normalize_tags()
       cmd/
         _common.py        # outline snapshots, changeReport + userSummary,
                           # schema validation, common response helpers
         create.py         # one file per CLI subcommand:
-        open.py           # ... non-destructive open with reconcile
+        open.py           # ... non-destructive open with reconcile + trailer
         close.py
-        outline.py        # ... explicit source param
-        get.py             # ... explicit source param
-        set.py             # ... writes:[] batch + mode + auto-split
-        review.py          # ... toState + accept/reject shortcuts
-        save.py             # ... save never mutates state; foreign->local flip
-        insert.py            # ... mode subtree auto-split
+        outline.py        # ... filterStates DSL + titleContains + tagsContain
+        read.py           # ... bulk section reads + assist sub-agent
+        get.py            # ... explicit source param
+        set.py            # ... writes:[] batch + mode + auto-split + tags
+        review.py         # ... toState + accept/reject shortcuts
+        tag.py            # set/add/remove on the tag axis; no body rewrite
+        save.py           # ... save never mutates state; foreign->local flip;
+                          # writes the trailer
+        insert.py         # ... mode subtree auto-split + tags
         delete.py
         move.py
-        dispatch.py          # ... resultState + schema-aware working state
-        list.py               # ... filterStates + touched entries
+        dispatch.py       # ... resultState + schema-aware working state
+        list.py           # ... filterStates + touched entries
         guide.py
-        patch.py              # search-replace patches
-        discover.py           # gitignore-aware doc discovery
+        patch.py          # search-replace patches
+        discover.py       # gitignore-aware doc discovery
+        search.py         # regex grep over titles/bodies with context lines
   docs/
     GUIDE.md              # served by markdown_guide
   mcp/
@@ -468,11 +551,66 @@ markdown-helper/
 - The `seed` field is a contract for what the section should
   cover. Reading a rejected section with `markdown_get` shows the
   reviewer's notes in `history[0].notes`.
+- **Three orthogonal axes** per section: body (the prose), state
+  (pipeline position from your declared schema), and tags (free-
+  form topic labels). The verbs `markdown_set` / `markdown_review`
+  / `markdown_tag` each operate on one axis without disturbing the
+  others.
 - All read tools take an explicit `source: 'workspace' | 'disk'`.
   Disk reads write a `touched.json` registry entry under the
   workspace dir, so an agent that read a doc without opening it
   shows up in `markdown_list` as `workspaceState: 'touched'` --
   no SQLite workspace was created.
+- **Saved files are self-describing.** Per-section state, seeds,
+  and tags round-trip through an HTML-comment trailer at the end
+  of the .md, so dropping the workspace cache doesn't lose
+  metadata. The trailer is invisible in rendered markdown.
 - Every mutation response includes a `userSummary` string
   (multi-line, human-readable) plus the structured `changeReport`.
   Surface `userSummary` to the user when summarizing a tool call.
+
+
+<!-- markdown-helper:v1
+{
+  "schema": [
+    {
+      "initial": true,
+      "name": "pending"
+    },
+    {
+      "name": "in-progress"
+    },
+    {
+      "name": "done",
+      "terminal": true
+    }
+  ],
+  "sections": {
+    "A.3": {
+      "state": "done",
+      "title": "Tools"
+    },
+    "A.5.2": {
+      "state": "done",
+      "title": "Tags"
+    },
+    "A.5.3": {
+      "state": "done",
+      "title": "Trailer block (round-trip metadata)"
+    },
+    "A.5.5": {
+      "state": "done",
+      "title": "Editing model"
+    },
+    "A.6": {
+      "state": "done",
+      "title": "Layout"
+    },
+    "A.7": {
+      "state": "done",
+      "title": "Conventions"
+    }
+  },
+  "v": 1
+}
+-->

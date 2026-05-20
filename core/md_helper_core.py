@@ -60,6 +60,8 @@ from md.cmd import (
     read,
     patch as patch_cmd,
     discover,
+    search as search_cmd,
+    tag as tag_cmd,
 )
 
 
@@ -69,7 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
     for module in (
         create, open_cmd, close, outline, get, set_cmd, review, save,
         insert, delete, move, dispatch, list_cmd, guide, read,
-        patch_cmd, discover,
+        patch_cmd, discover, search_cmd, tag_cmd,
     ):
         module.register_parser(sub)
     return p

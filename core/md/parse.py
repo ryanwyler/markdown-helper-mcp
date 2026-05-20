@@ -132,11 +132,12 @@ class Section:
     depth: int                   # 1 = top-level, 2 = subsection, ...
     body: str
     children: list["Section"] = field(default_factory=list)
-    # Workspace-only metadata. None in disk-mode.
+    # Workspace-only metadata. None / empty in disk-mode.
     uuid: str | None = None
     state: str | None = None
     seed: str | None = None
     session_id: str | None = None
+    tags: list[str] = field(default_factory=list)
 
 
 def parse_disk_outline(file_path: Path) -> list[Section]:

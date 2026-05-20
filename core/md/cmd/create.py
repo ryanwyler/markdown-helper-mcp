@@ -154,7 +154,7 @@ def cmd_create(args: argparse.Namespace) -> int:
     response = {
         "filename": filename,
         "fileOnDisk": False,
-        "states": list(schema.names()),
+        "states": schema.to_response(),
         "sections": sections_out,
         "nextSteps": [
             f"Fill sections one at a time with markdown_set "

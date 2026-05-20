@@ -49,7 +49,12 @@ def register_parser(sub) -> None:
     p = sub.add_parser("dispatch",
                        help="spawn (or kill) an opencode sub-agent on a section")
     p.add_argument("--filename", required=True)
-    p.add_argument("--section-number", required=True)
+    p.add_argument("--section-number", required=True,
+                   help="sectionNumber OR title.")
+    p.add_argument("--parent-section",
+                   help="scope title-resolution to the named section's "
+                        "subtree (use when --section-number is a title "
+                        "that matches multiple sections).")
     p.add_argument("--kill", action="store_true",
                    help="kill any running dispatch; resets section to schema's initial state")
     p.add_argument("--agent", default="build",
@@ -91,7 +96,11 @@ def _cmd_dispatch_spawn(args, ws_dir, filename: str) -> int:
         schema = c.schema_or_die(conn)
         reconcile_all_dispatched(conn)
 
-        uuid = c.resolve_section_or_die(conn, args.section_number)
+        uuid = c.resolve_section_handle(
+            conn, args.section_number,
+            parent_scope=args.parent_section,
+            arg_name="section-number",
+        )
         if uuid is None:
             return 1
         sec = fetch_section(conn, uuid)
@@ -243,7 +252,11 @@ def _cmd_dispatch_spawn(args, ws_dir, filename: str) -> int:
 def _cmd_dispatch_kill(args, ws_dir, filename: str) -> int:
     with open_db(ws_dir / "db.sqlite3") as conn:
         schema = c.schema_or_die(conn)
-        uuid = c.resolve_section_or_die(conn, args.section_number)
+        uuid = c.resolve_section_handle(
+            conn, args.section_number,
+            parent_scope=args.parent_section,
+            arg_name="section-number",
+        )
         if uuid is None:
             return 1
         sec = fetch_section(conn, uuid)

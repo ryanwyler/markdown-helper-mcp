@@ -261,7 +261,43 @@ class Schema:
                 return s.name
         return None
 
-    # -- serialization (for meta table) --------------------------------
+    # -- serialization --------------------------------------------------
+
+    def to_response(self) -> list[dict[str, Any]]:
+        """The agent-facing schema shape. List of objects, one per
+        state, with role flags ONLY when set (compact). Pass-back
+        compatible: this is the same shape the agent passes to
+        markdown_open's `states` param for the object form.
+
+        Example for [pending, in-progress, blocked, done, archived]
+        declared via positional inference:
+
+            [
+              {"name": "pending",     "initial":  true},
+              {"name": "in-progress"},
+              {"name": "blocked"},
+              {"name": "done"},
+              {"name": "archived",    "terminal": true},
+            ]
+
+        Use this in any response that wants to show the schema to the
+        agent so they can see WHICH state is terminal, working, etc.
+        Knowing role flags matters: terminal states need force=true
+        to overwrite, working states are where dispatch lands, etc.
+        """
+        out: list[dict[str, Any]] = []
+        for s in self.states:
+            entry: dict[str, Any] = {"name": s.name}
+            if s.initial:
+                entry["initial"] = True
+            if s.working:
+                entry["working"] = True
+            if s.terminal:
+                entry["terminal"] = True
+            if s.needsAttention:
+                entry["needsAttention"] = True
+            out.append(entry)
+        return out
 
     def to_json(self) -> str:
         return json.dumps([

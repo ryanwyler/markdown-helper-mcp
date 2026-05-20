@@ -31,7 +31,12 @@ def register_parser(sub) -> None:
     p = sub.add_parser("review",
                        help="transition a section to a schema state (with optional notes)")
     p.add_argument("--filename", required=True)
-    p.add_argument("--section-number", required=True)
+    p.add_argument("--section-number", required=True,
+                   help="sectionNumber OR title.")
+    p.add_argument("--parent-section",
+                   help="scope title-resolution to the named section's "
+                        "subtree (use when --section-number is a title "
+                        "that matches multiple sections).")
     grp = p.add_mutually_exclusive_group(required=True)
     grp.add_argument("--to-state",
                      help="explicit target state (must be in declared schema)")
@@ -87,7 +92,11 @@ def cmd_review(args: argparse.Namespace) -> int:
                     c.emit_error({"error": "--notes is required when rejecting"})
                     return 2
 
-        uuid = c.resolve_section_or_die(conn, args.section_number)
+        uuid = c.resolve_section_handle(
+            conn, args.section_number,
+            parent_scope=args.parent_section,
+            arg_name="section-number",
+        )
         if uuid is None:
             return 1
         sec = fetch_section(conn, uuid)
@@ -102,18 +111,28 @@ def cmd_review(args: argparse.Namespace) -> int:
             })
             return 1
 
-        update_section_content(
-            conn, uuid,
-            content=sec.content,
-            state=target_state,
-            updated_by="primary",
-            session_id=None,
-            now=now(),
-        )
-        record_revision(
-            conn, section_id=uuid, content=sec.content, state=target_state,
-            notes=args.notes, by="primary",
-        )
+        # No-op detection: if the section is already in target_state AND
+        # there are no notes to record, the call is a true no-op. Skip
+        # the write + revision row so audit history stays meaningful
+        # (revisions should record change, not redundant pokes).
+        #
+        # Notes-without-state-change is NOT a no-op: a reviewer adding
+        # a comment is a legitimate audit event even when state stays.
+        is_noop = sec.state == target_state and not args.notes
+
+        if not is_noop:
+            update_section_content(
+                conn, uuid,
+                content=sec.content,
+                state=target_state,
+                updated_by="primary",
+                session_id=None,
+                now=now(),
+            )
+            record_revision(
+                conn, section_id=uuid, content=sec.content, state=target_state,
+                notes=args.notes, by="primary",
+            )
 
         sec_after = fetch_section(conn, uuid)
         response = c.summarize_section(conn, sec_after) if sec_after else {}
@@ -124,5 +143,7 @@ def cmd_review(args: argparse.Namespace) -> int:
         response["action"] = args.action
     if args.notes:
         response["notes"] = args.notes
+    if is_noop:
+        response["noOp"] = True
     c.emit(response, args.pretty)
     return 0

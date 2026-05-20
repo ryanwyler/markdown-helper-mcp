@@ -49,6 +49,7 @@ from . import _common as c
 from ..dispatch import reconcile_all_dispatched
 from ..render import render_document
 from ..sections import fetch_all_sections_in_order, fetch_children
+from ..trailer import _is_default_schema, collect_trailer_data, render_trailer
 from ..storage import (
     cwd_path,
     file_abs_path,
@@ -159,7 +160,28 @@ def cmd_save(args: argparse.Namespace) -> int:
                 })
                 return 1
 
-        rendered = render_document(conn)
+        # Build the trailer block + identify archived sections to hide
+        # from the rendered markdown. The trailer round-trips per-
+        # section state, seeds, tags, and archived subtrees so re-
+        # opening this file in a new workspace recovers what the agent
+        # established.
+        from ..storage import get_schema as _get_schema_save
+        schema_for_trailer = _get_schema_save(conn)
+        initial_state = schema_for_trailer.initial_state()
+        trailer_sections, trailer_archived, skip_uuids = collect_trailer_data(
+            conn,
+            schema=schema_for_trailer,
+            initial_state=initial_state,
+        )
+        rendered_body = render_document(conn, skip_section_ids=skip_uuids)
+        trailer_text = render_trailer(
+            trailer_sections, trailer_archived,
+            schema=schema_for_trailer,
+            schema_is_default=_is_default_schema(schema_for_trailer),
+        )
+        # The rendered body always ends in a newline; the trailer
+        # contributes its own leading blank line (see render_trailer).
+        rendered = rendered_body + trailer_text if trailer_text else rendered_body
 
     # Resolve the on-disk destination.
     project_root = find_project_root()

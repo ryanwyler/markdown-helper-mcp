@@ -185,7 +185,12 @@ def register_parser(sub) -> None:
     p = sub.add_parser("patch",
                        help="apply search-replace edits to a section or subtree")
     p.add_argument("--filename", required=True)
-    p.add_argument("--section-number", required=True)
+    p.add_argument("--section-number", required=True,
+                   help="sectionNumber OR title.")
+    p.add_argument("--parent-section",
+                   help="scope title-resolution to the named section's "
+                        "subtree (use when --section-number is a title "
+                        "that matches multiple sections).")
     p.add_argument("--scope", choices=["body", "subtree"], default="body",
                    help="body: patch is applied to the section's body only. "
                         "subtree: patch is applied to the rendered markdown "
@@ -222,7 +227,11 @@ def cmd_patch(args: argparse.Namespace) -> int:
     with open_db(ws_dir / "db.sqlite3") as conn:
         schema = c.schema_or_die(conn)
 
-        uuid = c.resolve_section_or_die(conn, args.section_number)
+        uuid = c.resolve_section_handle(
+            conn, args.section_number,
+            parent_scope=args.parent_section,
+            arg_name="section-number",
+        )
         if uuid is None:
             return 1
         sec = fetch_section(conn, uuid)
@@ -363,7 +372,10 @@ def cmd_patch(args: argparse.Namespace) -> int:
             )
 
         after_snapshot = c.take_outline_snapshot(conn)
-        report = c.compute_change_report(before_snapshot, after_snapshot, filename)
+        report = c.compute_change_report(
+            before_snapshot, after_snapshot, filename,
+            conn=conn, by=by,
+        )
 
     response = {
         "filename": filename,
@@ -372,7 +384,6 @@ def cmd_patch(args: argparse.Namespace) -> int:
         "blocksApplied": len(blocks),
         "changeReport": report["changeReport"],
         "userSummary": report["userSummary"],
-        "outline": report["outline"],
     }
     c.emit(response, args.pretty)
     return 0

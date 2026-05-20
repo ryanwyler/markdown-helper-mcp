@@ -20,7 +20,11 @@ from .sections import fetch_children
 MAX_HEADING_LEVEL = 6
 
 
-def render_document(conn: sqlite3.Connection) -> str:
+def render_document(
+    conn: sqlite3.Connection,
+    *,
+    skip_section_ids: set[str] | None = None,
+) -> str:
     """Concatenate all sections into a single markdown document.
 
     Pre-order DFS through the forest: each top-level section first
@@ -29,9 +33,15 @@ def render_document(conn: sqlite3.Connection) -> str:
 
     Sections are joined with a single blank line between them, matching
     the conventional `# Heading\\n\\nbody\\n\\n## Next heading` style.
+
+    `skip_section_ids` (a set of UUIDs): sections whose UUID is in
+    this set are entirely omitted from the output, including their
+    descendants. Used by save to hide archived subtrees from the
+    rendered markdown.
     """
     blocks: list[str] = []
-    _render_into(conn, blocks, parent_id=None, depth=1)
+    _render_into(conn, blocks, parent_id=None, depth=1,
+                 skip=skip_section_ids or set())
     return "\n\n".join(blocks).rstrip() + "\n"
 
 
@@ -41,10 +51,16 @@ def _render_into(
     *,
     parent_id: str | None,
     depth: int,
+    skip: set[str],
 ) -> None:
     """Walk children of `parent_id` in chain order; emit each as
-    one or more blocks; recurse into descendants."""
+    one or more blocks; recurse into descendants. Skip any section
+    (and its subtree) whose UUID is in `skip`."""
     for sec in fetch_children(conn, parent_id):
+        if sec.id in skip:
+            # Drop this section AND its descendants from the rendered
+            # output. Archived subtrees live only in the trailer.
+            continue
         body = (sec.content or "").rstrip()
         if sec.title is None:
             # Headless preamble section: just emit the body.
@@ -57,4 +73,4 @@ def _render_into(
             if body:
                 blocks.append(body)
         # Recurse: this section's children render at depth+1.
-        _render_into(conn, blocks, parent_id=sec.id, depth=depth + 1)
+        _render_into(conn, blocks, parent_id=sec.id, depth=depth + 1, skip=skip)

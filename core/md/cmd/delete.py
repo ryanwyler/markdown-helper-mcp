@@ -23,7 +23,12 @@ def register_parser(sub) -> None:
     p = sub.add_parser("delete",
                        help="remove a section (heals the chain; deletes descendants by default)")
     p.add_argument("--filename", required=True)
-    p.add_argument("--section-number", required=True)
+    p.add_argument("--section-number", required=True,
+                   help="sectionNumber OR title.")
+    p.add_argument("--parent-section",
+                   help="scope title-resolution to the named section's "
+                        "subtree (use when --section-number is a title "
+                        "that matches multiple sections).")
     p.add_argument("--no-recursive", dest="recursive", action="store_false",
                    default=True,
                    help="refuse if the section has children")
@@ -40,7 +45,11 @@ def cmd_delete(args: argparse.Namespace) -> int:
     _, ws_dir, filename = resolved
 
     with open_db(ws_dir / "db.sqlite3") as conn:
-        uuid = c.resolve_section_or_die(conn, args.section_number)
+        uuid = c.resolve_section_handle(
+            conn, args.section_number,
+            parent_scope=args.parent_section,
+            arg_name="section-number",
+        )
         if uuid is None:
             return 1
         sec = fetch_section(conn, uuid)
@@ -88,14 +97,16 @@ def cmd_delete(args: argparse.Namespace) -> int:
             return 1
 
         after_snapshot = c.take_outline_snapshot(conn)
-        report = c.compute_change_report(before_snapshot, after_snapshot, filename)
+        report = c.compute_change_report(
+            before_snapshot, after_snapshot, filename,
+            conn=conn, by="primary",
+        )
 
     response = {
         "filename": filename,
         "deletedCount": count,
         "changeReport": report["changeReport"],
         "userSummary": report["userSummary"],
-        "outline": report["outline"],
     }
     c.emit(response, args.pretty)
     return 0

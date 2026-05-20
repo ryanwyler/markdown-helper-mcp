@@ -114,6 +114,7 @@ const TOOLS_WITH_REMINDER = new Set<string>([
   "markdown_outline",
   "markdown_save",
   "markdown_review",
+  "markdown_tag",
   "markdown_dispatch",
   "markdown_list",
   "markdown_insert",
@@ -123,6 +124,7 @@ const TOOLS_WITH_REMINDER = new Set<string>([
   "markdown_set",
   "markdown_patch",
   "markdown_discover",
+  "markdown_search",
 ]);
 
 const REMINDER_TEXT =
@@ -332,6 +334,9 @@ async function dispatch(toolName: string, args: Record<string, any>): Promise<Wr
       cliArgs.push("--filename", String(args.filename));
       cliArgs.push("--source", String(args.source));
       if (args.filterStates) cliArgs.push("--filter-states", String(args.filterStates));
+      if (args.titleContains) cliArgs.push("--title-contains", String(args.titleContains));
+      if (args.tagsContain) cliArgs.push("--tags-contain", String(args.tagsContain));
+      if (args.format) cliArgs.push("--format", String(args.format));
       cliArgs.push("--pretty");
       break;
     }
@@ -343,6 +348,7 @@ async function dispatch(toolName: string, args: Record<string, any>): Promise<Wr
       if (!args?.source) return toolText(JSON.stringify({ error: "source is required ('workspace' or 'disk')" }), true);
       cliArgs.push("--filename", String(args.filename));
       cliArgs.push("--section-number", String(args.sectionNumber));
+      if (args.parentSection) cliArgs.push("--parent-section", String(args.parentSection));
       cliArgs.push("--source", String(args.source));
       cliArgs.push("--pretty");
       break;
@@ -364,12 +370,14 @@ async function dispatch(toolName: string, args: Record<string, any>): Promise<Wr
           return toolText(JSON.stringify({ error: "content or contentFile is required" }), true);
         }
         cliArgs.push("--section-number", String(args.sectionNumber));
+        if (args.parentSection) cliArgs.push("--parent-section", String(args.parentSection));
         if (args.content !== undefined) cliArgs.push("--content", String(args.content));
         if (args.contentFile) cliArgs.push("--content-file", String(args.contentFile));
         if (args.title !== undefined) cliArgs.push("--title", String(args.title));
         if (args.seed !== undefined) cliArgs.push("--seed", String(args.seed));
         if (args.state) cliArgs.push("--state", String(args.state));
         if (args.mode) cliArgs.push("--mode", String(args.mode));
+        if (args.tags !== undefined) cliArgs.push("--tags", JSON.stringify(args.tags));
         if (args.by) cliArgs.push("--by", String(args.by));
         if (args.sessionId) cliArgs.push("--session-id", String(args.sessionId));
         if (args.force) cliArgs.push("--force");
@@ -387,9 +395,48 @@ async function dispatch(toolName: string, args: Record<string, any>): Promise<Wr
       }
       cliArgs.push("--filename", String(args.filename));
       cliArgs.push("--section-number", String(args.sectionNumber));
+      if (args.parentSection) cliArgs.push("--parent-section", String(args.parentSection));
       if (args.toState) cliArgs.push("--to-state", String(args.toState));
       else if (args.action) cliArgs.push("--action", String(args.action));
       if (args.notes) cliArgs.push("--notes", String(args.notes));
+      cliArgs.push("--pretty");
+      break;
+    }
+
+    case "markdown_tag": {
+      cliArgs.push("tag");
+      if (!args?.filename) return toolText(JSON.stringify({ error: "filename is required" }), true);
+      cliArgs.push("--filename", String(args.filename));
+      if (args.writes !== undefined) {
+        // Batch form
+        if (args.sectionNumber || args.set !== undefined || args.add !== undefined || args.remove !== undefined) {
+          return toolText(JSON.stringify({
+            error: "writes is mutually exclusive with single-section flags " +
+                   "(sectionNumber / set / add / remove)",
+          }), true);
+        }
+        cliArgs.push("--writes-json", JSON.stringify(args.writes));
+      } else {
+        // Single-section form
+        if (!args.sectionNumber) {
+          return toolText(JSON.stringify({
+            error: "sectionNumber is required (or use writes:[])",
+          }), true);
+        }
+        cliArgs.push("--section-number", String(args.sectionNumber));
+        if (args.parentSection) cliArgs.push("--parent-section", String(args.parentSection));
+        const opCount = [args.set, args.add, args.remove].filter(x => x !== undefined).length;
+        if (opCount !== 1) {
+          return toolText(JSON.stringify({
+            error: "exactly one of set / add / remove is required",
+          }), true);
+        }
+        if (args.set !== undefined) cliArgs.push("--set", JSON.stringify(args.set));
+        else if (args.add !== undefined) cliArgs.push("--add", JSON.stringify(args.add));
+        else if (args.remove !== undefined) cliArgs.push("--remove", JSON.stringify(args.remove));
+      }
+      if (args.by) cliArgs.push("--by", String(args.by));
+      if (args.sessionId) cliArgs.push("--session-id", String(args.sessionId));
       cliArgs.push("--pretty");
       break;
     }
@@ -419,6 +466,7 @@ async function dispatch(toolName: string, args: Record<string, any>): Promise<Wr
       else if (args.after) cliArgs.push("--after", String(args.after));
       else if (args.under) cliArgs.push("--under", String(args.under));
       else if (args.topLevel) cliArgs.push("--top-level");
+      if (args.parentSection) cliArgs.push("--parent-section", String(args.parentSection));
 
       if (args.title !== undefined) cliArgs.push("--title", String(args.title));
       if (args.seed) cliArgs.push("--seed", String(args.seed));
@@ -426,6 +474,7 @@ async function dispatch(toolName: string, args: Record<string, any>): Promise<Wr
       if (args.contentFile) cliArgs.push("--content-file", String(args.contentFile));
       if (args.mode) cliArgs.push("--mode", String(args.mode));
       if (args.state) cliArgs.push("--state", String(args.state));
+      if (args.tags !== undefined) cliArgs.push("--tags", JSON.stringify(args.tags));
       if (args.by) cliArgs.push("--by", String(args.by));
       cliArgs.push("--pretty");
       break;
@@ -437,6 +486,7 @@ async function dispatch(toolName: string, args: Record<string, any>): Promise<Wr
       if (!args?.sectionNumber) return toolText(JSON.stringify({ error: "sectionNumber is required" }), true);
       cliArgs.push("--filename", String(args.filename));
       cliArgs.push("--section-number", String(args.sectionNumber));
+      if (args.parentSection) cliArgs.push("--parent-section", String(args.parentSection));
       if (args.recursive === false) cliArgs.push("--no-recursive");
       if (args.force) cliArgs.push("--force");
       cliArgs.push("--pretty");
@@ -460,6 +510,7 @@ async function dispatch(toolName: string, args: Record<string, any>): Promise<Wr
       else if (args.after) cliArgs.push("--after", String(args.after));
       else if (args.under) cliArgs.push("--under", String(args.under));
       else if (args.topLevel) cliArgs.push("--top-level");
+      if (args.parentSection) cliArgs.push("--parent-section", String(args.parentSection));
       cliArgs.push("--pretty");
       break;
     }
@@ -479,6 +530,7 @@ async function dispatch(toolName: string, args: Record<string, any>): Promise<Wr
       if (!args?.sectionNumber) return toolText(JSON.stringify({ error: "sectionNumber is required" }), true);
       cliArgs.push("--filename", String(args.filename));
       cliArgs.push("--section-number", String(args.sectionNumber));
+      if (args.parentSection) cliArgs.push("--parent-section", String(args.parentSection));
       if (args.kill) cliArgs.push("--kill");
       if (args.agent) cliArgs.push("--agent", String(args.agent));
       if (args.model) cliArgs.push("--model", String(args.model));
@@ -516,6 +568,7 @@ async function dispatch(toolName: string, args: Record<string, any>): Promise<Wr
       if (!args?.patch) return toolText(JSON.stringify({ error: "patch is required" }), true);
       cliArgs.push("--filename", String(args.filename));
       cliArgs.push("--section-number", String(args.sectionNumber));
+      if (args.parentSection) cliArgs.push("--parent-section", String(args.parentSection));
       cliArgs.push("--patch", String(args.patch));
       if (args.scope) cliArgs.push("--scope", String(args.scope));
       if (args.state) cliArgs.push("--state", String(args.state));
@@ -532,6 +585,20 @@ async function dispatch(toolName: string, args: Record<string, any>): Promise<Wr
       if (args?.recursive) cliArgs.push("--recursive");
       if (args?.limit !== undefined) cliArgs.push("--limit", String(args.limit));
       if (args?.ignoreGitignore) cliArgs.push("--ignore-gitignore");
+      cliArgs.push("--pretty");
+      break;
+    }
+
+    case "markdown_search": {
+      cliArgs.push("search");
+      if (!args?.filename) return toolText(JSON.stringify({ error: "filename is required" }), true);
+      if (!args?.pattern) return toolText(JSON.stringify({ error: "pattern is required" }), true);
+      cliArgs.push("--filename", String(args.filename));
+      cliArgs.push("--pattern", String(args.pattern));
+      if (args.scope) cliArgs.push("--scope", String(args.scope));
+      if (args.caseSensitive) cliArgs.push("--case-sensitive");
+      if (args.context !== undefined) cliArgs.push("--context", String(args.context));
+      if (args.limit !== undefined) cliArgs.push("--limit", String(args.limit));
       cliArgs.push("--pretty");
       break;
     }
@@ -687,25 +754,41 @@ const TOOLS: Tool[] = [
     description:
       "Use this when you want to see what's in a doc at a glance -- THE SCOREBOARD. " +
       "Run early in a session to find live work; run between batches of mutations to " +
-      "re-orient after section numbers shift. The filterStates parameter is your " +
-      "friend: filterStates='in-progress,blocked,under-review' surfaces only what " +
-      "needs attention, ignoring 100s of settled or historical sections.\n\n" +
+      "re-orient after section numbers shift.\n\n" +
+      "DEFAULT VIEW IS LIVE WORK. By default the outline excludes the `loaded` " +
+      "pseudo-state (sections that came in from disk and haven't been touched this " +
+      "session) AND all terminal states (typically `done`, `archived`, `deferred`). " +
+      "So a fresh `markdown_outline` answers 'what's active?' not 'what exists?' " +
+      "in the doc.\n\n" +
+      "filterStates accepts:\n" +
+      "  (omitted)      : default -- exclude loaded + terminal states.\n" +
+      "  'all'          : show everything; disable the default filter.\n" +
+      "  'a,b,c'        : show ONLY these states (positive list).\n" +
+      "  '!loaded,!done': show everything EXCEPT these (negation).\n" +
+      "  'a,!b'         : positive list wins when any positive is named.\n\n" +
+      "titleContains: case-insensitive substring filter on titles. Combine with " +
+      "filterStates: 'in-progress,blocked' + titleContains: 'billing' to find " +
+      "active work on a specific topic.\n\n" +
+      "format:\n" +
+      "  structured (default): list of section objects {sectionNumber, title, " +
+      "depth, state, wordCount, seed}.\n" +
+      "  compact            : list of single-line strings " +
+      "(`A.1 | depth=2 | done | 65w | Title`). ~10x smaller; preferred for big docs.\n\n" +
       "Requires explicit `source`:\n" +
       "  workspace: in-memory view (must be open). Includes state, seeds, save " +
       "staleness, nextFocus.\n" +
-      "  disk: parses the file fresh; no state machine, no states returned. " +
-      "Side-effect: writes a touched.json marker so the file shows up in markdown_list.\n\n" +
-      "filterStates is comma-separated (e.g., 'pending,in-progress'). Matches by exact " +
-      "state name. Filters individual sections, not subtrees -- a parent in 'done' " +
-      "state will not surface a child in 'in-progress' state via the parent. " +
-      "filterStates is workspace-only (disk has no states to filter).",
+      "  disk: parses the file fresh; no state machine. titleContains works in disk " +
+      "mode; filterStates is silently ignored (disk has no states beyond `loaded`).",
     inputSchema: {
       type: "object",
       required: ["filename", "source"],
       properties: {
         filename: { type: "string" },
         source: { type: "string", enum: ["workspace", "disk"] },
-        filterStates: { type: "string", description: "Comma-separated state names." },
+        filterStates: { type: "string", description: "State filter; see description for DSL." },
+        titleContains: { type: "string", description: "Case-insensitive substring filter on titles." },
+        tagsContain: { type: "string", description: "Comma-separated tags; matches sections that carry ALL of them. Workspace only." },
+        format: { type: "string", enum: ["structured", "compact"], description: "Output shape (default structured)." },
       },
     },
   },
@@ -724,7 +807,8 @@ const TOOLS: Tool[] = [
       required: ["filename", "sectionNumber", "source"],
       properties: {
         filename: { type: "string" },
-        sectionNumber: { type: "string" },
+        sectionNumber: { type: "string", description: "sectionNumber OR title." },
+        parentSection: { type: "string", description: "Scope title-resolution to the named section's subtree." },
         source: { type: "string", enum: ["workspace", "disk"] },
       },
     },
@@ -753,21 +837,31 @@ const TOOLS: Tool[] = [
       "put.\n\n" +
       "FORCE: required only when overwriting a section in a TERMINAL state. " +
       "loaded/initial/working/needsAttention sections accept writes freely.\n\n" +
-      "Returns standard changeReport + outline + userSummary. Surface userSummary " +
-      "verbatim to user when they ask for status. The outline reflects post-mutation " +
-      "section numbers -- re-plan against it.",
+      "Returns changeReport + userSummary describing the delta. Surface " +
+      "userSummary verbatim to user when they ask for status. SectionNumbers may " +
+      "shift; call markdown_outline if you need the post-mutation tree.",
     inputSchema: {
       type: "object",
       required: ["filename"],
       properties: {
         filename: { type: "string" },
-        sectionNumber: { type: "string" },
+        sectionNumber: { type: "string", description: "sectionNumber OR title." },
+        parentSection: { type: "string", description: "Scope title-resolution to the named section's subtree." },
         content: { type: "string" },
         contentFile: { type: "string" },
         title: { type: "string" },
         seed: { type: "string" },
         state: { type: "string" },
         mode: { type: "string", enum: ["body", "subtree"] },
+        tags: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Replace the section's tag set. Lowercase-normalized; " +
+            "whitespace within a tag rejected. Pass [] to clear. " +
+            "Tags are identifiers, not free-form notes. Single-section " +
+            "mode only; ignored when `writes` is used (set per-write).",
+        },
         force: { type: "boolean" },
         by: { type: "string" },
         sessionId: { type: "string" },
@@ -777,12 +871,14 @@ const TOOLS: Tool[] = [
             type: "object",
             required: ["sectionNumber", "content"],
             properties: {
-              sectionNumber: { type: "string" },
+              sectionNumber: { type: "string", description: "sectionNumber OR title." },
+              parentSection: { type: "string", description: "Scope title-resolution to the named section's subtree." },
               content: { type: "string" },
               title: { type: "string" },
               seed: { type: "string" },
               state: { type: "string" },
               mode: { type: "string", enum: ["body", "subtree"] },
+              tags: { type: "array", items: { type: "string" } },
             },
           },
         },
@@ -810,10 +906,73 @@ const TOOLS: Tool[] = [
       required: ["filename", "sectionNumber"],
       properties: {
         filename: { type: "string" },
-        sectionNumber: { type: "string" },
+        sectionNumber: { type: "string", description: "sectionNumber OR title." },
+        parentSection: { type: "string", description: "Scope title-resolution to the named section's subtree." },
         toState: { type: "string" },
         action: { type: "string", enum: ["accept", "reject"] },
         notes: { type: "string" },
+      },
+    },
+  },
+  {
+    name: "markdown_tag",
+    description:
+      "Use this when you want to edit a section's TAGS without rewriting its " +
+      "body. The third orthogonal-axis verb alongside markdown_set (body) and " +
+      "markdown_review (state). Tags are metadata stored in the trailer; they " +
+      "don't appear in the visible markdown but drive filterable queries via " +
+      "markdown_outline's tagsContain.\n\n" +
+      "Three mutually-exclusive operations per write (pick exactly one):\n" +
+      "  set:    [a, b]  -- REPLACE the tag set entirely.\n" +
+      "  add:    [a, b]  -- UNION with existing tags. Safe for parallel taggers.\n" +
+      "  remove: [a, b]  -- SET DIFFERENCE; existing minus these.\n\n" +
+      "Single-section form passes sectionNumber + one of set/add/remove. Batch " +
+      "form passes writes: [{sectionNumber, set|add|remove, parentSection?}, ...] " +
+      "for atomic multi-section labeling (one transaction, all-or-nothing).\n\n" +
+      "No content required, no force gate, no shift -- tag edits never renumber " +
+      "sections. No-op writes (tag set already matches) are detected and skipped " +
+      "so revision history stays meaningful.\n\n" +
+      "Returns per-section {before, after, op, opArg, noOp} plus the standard " +
+      "changeReport (modified entries only).",
+    inputSchema: {
+      type: "object",
+      required: ["filename"],
+      properties: {
+        filename: { type: "string" },
+        sectionNumber: { type: "string", description: "sectionNumber OR title. Required unless writes is provided." },
+        parentSection: { type: "string", description: "Scope title-resolution to the named section's subtree." },
+        set: {
+          type: "array",
+          items: { type: "string" },
+          description: "REPLACE the tag set entirely. Mutually exclusive with add/remove.",
+        },
+        add: {
+          type: "array",
+          items: { type: "string" },
+          description: "UNION with existing tags. Mutually exclusive with set/remove.",
+        },
+        remove: {
+          type: "array",
+          items: { type: "string" },
+          description: "SET DIFFERENCE; existing minus these. Mutually exclusive with set/add.",
+        },
+        writes: {
+          type: "array",
+          description: "Batch form. Each entry needs sectionNumber + exactly one of set/add/remove.",
+          items: {
+            type: "object",
+            required: ["sectionNumber"],
+            properties: {
+              sectionNumber: { type: "string" },
+              parentSection: { type: "string" },
+              set: { type: "array", items: { type: "string" } },
+              add: { type: "array", items: { type: "string" } },
+              remove: { type: "array", items: { type: "string" } },
+            },
+          },
+        },
+        by: { type: "string", description: "Author attribution; recorded in revision history." },
+        sessionId: { type: "string" },
       },
     },
   },
@@ -851,34 +1010,52 @@ const TOOLS: Tool[] = [
       "primary write tool for brain-mode capture: discover something, insert a " +
       "topic card under the right parent, set its state, move on.\n\n" +
       "Inserts a new section. Use EXACTLY ONE of: before, after, under, topLevel.\n\n" +
-      "Positioning semantics (resolve target by TITLE, never by section number -- " +
-      "numbers shift on every mutation):\n" +
-      "  under: '<parent-title>'  -> appended as the LAST CHILD of <parent>\n" +
-      "  before: '<sibling>'      -> inserted as a same-depth sibling, IMMEDIATELY " +
-      "BEFORE <sibling>\n" +
-      "  after: '<sibling>'       -> inserted as a same-depth sibling, IMMEDIATELY " +
-      "AFTER <sibling>\n" +
-      "  topLevel: true           -> appended as the LAST TOP-LEVEL section\n\n" +
+      "Positioning targets resolve as: try as sectionNumber first ('A', 'A.1.2', " +
+      "'0'); fall back to exact title match. Titles are preferred because section " +
+      "numbers shift on every mutation:\n" +
+      "  under: '<parent>'   -> appended as the LAST CHILD of <parent>\n" +
+      "  before: '<sibling>' -> inserted as a same-depth sibling, IMMEDIATELY BEFORE <sibling>\n" +
+      "  after: '<sibling>'  -> inserted as a same-depth sibling, IMMEDIATELY AFTER <sibling>\n" +
+      "  topLevel: true      -> appended as the LAST TOP-LEVEL section\n\n" +
+      "If multiple sections share the same title, you get an `ambiguous title` " +
+      "error listing candidate sectionNumbers + their parents. Disambiguate with " +
+      "parentSection: '<ancestor sectionNumber>' to scope the title search to " +
+      "that ancestor's subtree.\n\n" +
+      "If you want a NEW top-level section to land RIGHT AFTER an existing one " +
+      "(e.g. you want it to become 'U' because 'T' currently exists), use " +
+      "after: 'T' or after: '<title of T>' -- NOT topLevel: true (which appends " +
+      "at the end of the entire forest).\n\n" +
       "If content has markdown headings and mode='subtree', the headings auto-split " +
       "into descendant sections (in source order). For literal headings inside the " +
       "section body, use mode='body' (the default).\n\n" +
-      "Returns standard changeReport + outline + userSummary. SectionNumbers shift " +
-      "on insert; re-plan against the post-mutation outline.",
+      "Returns changeReport + userSummary describing the structural delta. " +
+      "SectionNumbers shift on insert; call markdown_outline if you need the " +
+      "post-mutation view.",
     inputSchema: {
       type: "object",
       required: ["filename"],
       properties: {
         filename: { type: "string" },
-        before: { type: "string" },
-        after: { type: "string" },
-        under: { type: "string" },
+        before: { type: "string", description: "sectionNumber OR title to insert before" },
+        after: { type: "string", description: "sectionNumber OR title to insert after" },
+        under: { type: "string", description: "sectionNumber OR title to insert under (as last child)" },
         topLevel: { type: "boolean" },
+        parentSection: { type: "string", description: "Scope title-resolution to the named section's subtree." },
         title: { type: "string" },
         seed: { type: "string" },
         content: { type: "string" },
         contentFile: { type: "string" },
         mode: { type: "string", enum: ["body", "subtree"] },
         state: { type: "string" },
+        tags: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Tags for the new section. Lowercase-normalized; whitespace " +
+            "within a tag rejected. Tags are identifiers, not free-form " +
+            "notes. In subtree mode, only the outer section gets these " +
+            "tags -- auto-split children are untagged.",
+        },
         by: { type: "string" },
       },
     },
@@ -892,13 +1069,15 @@ const TOOLS: Tool[] = [
       "and why FIRST, then delete.\n\n" +
       "Removes a section. Deletes descendants by default (recursive=true). " +
       "Refuses if a sub-agent is currently running on the section unless force=true. " +
-      "Returns standard changeReport + outline + userSummary.",
+      "Returns changeReport + userSummary describing the delta. Call markdown_outline " +
+      "if you need the post-mutation tree.",
     inputSchema: {
       type: "object",
       required: ["filename", "sectionNumber"],
       properties: {
         filename: { type: "string" },
-        sectionNumber: { type: "string" },
+        sectionNumber: { type: "string", description: "sectionNumber OR title." },
+        parentSection: { type: "string", description: "Scope title-resolution to the named section's subtree." },
         recursive: { type: "boolean" },
         force: { type: "boolean" },
       },
@@ -912,22 +1091,25 @@ const TOOLS: Tool[] = [
       "the wrong parent: move them under their intended parent.\n\n" +
       "Moves a section to a new position. UUID + revision history are preserved. " +
       "Use EXACTLY ONE of: before, after, under, topLevel (same semantics as " +
-      "markdown_insert).\n\n" +
+      "markdown_insert -- targets accept sectionNumber OR title; use " +
+      "parentSection to scope title-resolution on ambiguous titles).\n\n" +
       "Move-in-batch caveat: section numbers shift on every move. When reordering " +
       "siblings, move them in reverse order (last first) so the earlier ones don't " +
       "shift out from under you. Or use TITLES as handles and re-check the outline " +
       "between moves.\n\n" +
-      "Returns standard changeReport + outline + userSummary.",
+      "Returns changeReport + userSummary describing the structural delta. Call " +
+      "markdown_outline if you need the post-mutation view.",
     inputSchema: {
       type: "object",
       required: ["filename", "sectionNumber"],
       properties: {
         filename: { type: "string" },
         sectionNumber: { type: "string" },
-        before: { type: "string" },
-        after: { type: "string" },
-        under: { type: "string" },
+        before: { type: "string", description: "sectionNumber OR title" },
+        after: { type: "string", description: "sectionNumber OR title" },
+        under: { type: "string", description: "sectionNumber OR title" },
         topLevel: { type: "boolean" },
+        parentSection: { type: "string", description: "Scope title-resolution to the named section's subtree." },
       },
     },
   },
@@ -960,7 +1142,8 @@ const TOOLS: Tool[] = [
       required: ["filename", "sectionNumber", "patch"],
       properties: {
         filename: { type: "string" },
-        sectionNumber: { type: "string" },
+        sectionNumber: { type: "string", description: "sectionNumber OR title." },
+        parentSection: { type: "string", description: "Scope title-resolution to the named section's subtree." },
         scope: { type: "string", enum: ["body", "subtree"] },
         patch: { type: "string" },
         state: { type: "string" },
@@ -1020,6 +1203,35 @@ const TOOLS: Tool[] = [
     },
   },
   {
+    name: "markdown_search",
+    description:
+      "Use this when you need to find sections by content -- regex grep across " +
+      "titles, bodies, or both. Different shape than `markdown_outline { titleContains }`: " +
+      "titleContains is the cheap 90% case (substring on titles only); " +
+      "markdown_search is for the heavy case (regex, body matches with context " +
+      "lines, lots of results).\n\n" +
+      "pattern is a Python regex. scope is comma-separated: 'title', 'body', or " +
+      "'title,body' (default). Case-insensitive by default; pass caseSensitive: " +
+      "true to disable. Results are returned in DOCUMENT ORDER -- no relevance " +
+      "ranking. The doc is read top-to-bottom; matches at the top come first.\n\n" +
+      "Each match returns sectionNumber + title + (for body matches) per-line " +
+      "matches with `before` / `after` context lines. Default context is 2 lines " +
+      "either side. Total matches capped at 200 by default (truncated: true in " +
+      "the response when hit); raise `limit` or narrow the pattern.",
+    inputSchema: {
+      type: "object",
+      required: ["filename", "pattern"],
+      properties: {
+        filename: { type: "string" },
+        pattern: { type: "string", description: "Python regex." },
+        scope: { type: "string", description: "Default 'title,body'. Use 'title' or 'body' to restrict." },
+        caseSensitive: { type: "boolean", description: "Default false." },
+        context: { type: "integer", description: "Lines of body context around each body match (default 2)." },
+        limit: { type: "integer", description: "Max matches returned (default 200)." },
+      },
+    },
+  },
+  {
     name: "markdown_dispatch",
     description:
       "Use this when a section needs deep elaboration you'd rather delegate -- " +
@@ -1046,7 +1258,8 @@ const TOOLS: Tool[] = [
       required: ["filename", "sectionNumber"],
       properties: {
         filename: { type: "string" },
-        sectionNumber: { type: "string" },
+        sectionNumber: { type: "string", description: "sectionNumber OR title." },
+        parentSection: { type: "string", description: "Scope title-resolution to the named section's subtree." },
         kill: { type: "boolean" },
         agent: { type: "string" },
         model: { type: "string" },

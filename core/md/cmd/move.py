@@ -33,13 +33,22 @@ def register_parser(sub) -> None:
                    help="sectionNumber of the section to move")
     grp = p.add_mutually_exclusive_group(required=True)
     grp.add_argument("--before",
-                     help="move just before this sectionNumber (same parent)")
+                     help="move just before this sectionNumber OR title "
+                          "(same parent). Title-resolution is global by "
+                          "default; pass --parent-section to scope.")
     grp.add_argument("--after",
-                     help="move just after this sectionNumber (same parent)")
+                     help="move just after this sectionNumber OR title "
+                          "(same parent). Title-resolution is global by "
+                          "default; pass --parent-section to scope.")
     grp.add_argument("--under",
-                     help="move as last child of this sectionNumber")
+                     help="move as last child of this sectionNumber OR "
+                          "title. Title-resolution is global by default; "
+                          "pass --parent-section to scope.")
     grp.add_argument("--top-level", action="store_true",
                      help="move to end of top-level chain")
+    p.add_argument("--parent-section",
+                   help="when --before/--after/--under is a title, scope "
+                        "the title search to the named section's subtree.")
     c.add_pretty(p)
     p.set_defaults(func=cmd_move)
 
@@ -51,7 +60,9 @@ def cmd_move(args: argparse.Namespace) -> int:
     _, ws_dir, filename = resolved
 
     with open_db(ws_dir / "db.sqlite3") as conn:
-        uuid = c.resolve_section_or_die(conn, args.section_number)
+        uuid = c.resolve_section_handle(
+            conn, args.section_number, arg_name="section-number",
+        )
         if uuid is None:
             return 1
         sec = fetch_section(conn, uuid)
@@ -67,13 +78,16 @@ def cmd_move(args: argparse.Namespace) -> int:
             return 1
 
         position_kwargs: dict = {}
+        parent_scope = args.parent_section
         if args.top_level:
             position_kwargs = {"at_top_level": True}
         else:
             for kw, val in (("before", args.before), ("after", args.after),
                             ("under", args.under)):
                 if val is not None:
-                    target_uuid = c.resolve_section_or_die(conn, val)
+                    target_uuid = c.resolve_section_handle(
+                        conn, val, parent_scope=parent_scope, arg_name=kw,
+                    )
                     if target_uuid is None:
                         return 1
                     if target_uuid == uuid:
@@ -109,7 +123,10 @@ def cmd_move(args: argparse.Namespace) -> int:
             return 1
 
         after_snapshot = c.take_outline_snapshot(conn)
-        report = c.compute_change_report(before_snapshot, after_snapshot, filename)
+        report = c.compute_change_report(
+            before_snapshot, after_snapshot, filename,
+            conn=conn, by="primary",
+        )
 
         new_addr = compute_section_number(conn, uuid)
 
@@ -118,7 +135,6 @@ def cmd_move(args: argparse.Namespace) -> int:
         "sectionNumber": new_addr.display,
         "changeReport": report["changeReport"],
         "userSummary": report["userSummary"],
-        "outline": report["outline"],
     }
     c.emit(response, args.pretty)
     return 0

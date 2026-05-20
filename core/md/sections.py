@@ -18,11 +18,12 @@ functions.
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from .ids import gen_uuid
 from .states import DEFAULT_INITIAL
+from .util import tags_from_json, tags_to_json
 
 
 # ---------------------------------------------------------------------------
@@ -43,6 +44,7 @@ class SectionRow:
     updated_at: int
     updated_by: str | None
     session_id: str | None
+    tags: list[str] = field(default_factory=list)
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "SectionRow":
@@ -58,6 +60,7 @@ class SectionRow:
             updated_at=row["updated_at"],
             updated_by=row["updated_by"],
             session_id=row["session_id"],
+            tags=tags_from_json(row["tags"]),
         )
 
 
@@ -146,6 +149,7 @@ def fetch_outline_tree(conn: sqlite3.Connection) -> list:
                 state=child.state,
                 seed=child.seed,
                 session_id=child.session_id,
+                tags=child.tags,
             )
             sec.children = build(child.id)
             out.append(sec)
@@ -188,6 +192,7 @@ def insert_section(
     state: str = DEFAULT_INITIAL,
     updated_by: str = "primary",
     now: int,
+    tags: list[str] | None = None,
 ) -> SectionRow:
     """Insert a new section into a parent's chain.
 
@@ -239,15 +244,16 @@ def insert_section(
         successor_id = old_next["id"] if old_next else None
 
     # Insert the new row first.
+    tags_json = tags_to_json(tags) if tags else None
     conn.execute(
         """INSERT INTO sections(id, parent_id, prev_sibling_id,
                                 title, seed, content, state,
                                 word_count, updated_at, updated_by,
-                                session_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)""",
+                                session_id, tags)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)""",
         (new_id, parent_id, prev_sibling_id,
          title, seed, content, state,
-         word_count, now, updated_by),
+         word_count, now, updated_by, tags_json),
     )
 
     # Heal the chain: successor (if any) now points at us.
@@ -273,6 +279,7 @@ def append_child(
     state: str = DEFAULT_INITIAL,
     updated_by: str = "primary",
     now: int,
+    tags: list[str] | None = None,
 ) -> SectionRow:
     """Append as the LAST child of `parent_id` (or last top-level if
     parent_id is None). Convenience over insert_section.
@@ -289,6 +296,7 @@ def append_child(
         state=state,
         updated_by=updated_by,
         now=now,
+        tags=tags,
     )
 
 
@@ -474,6 +482,9 @@ def move_section(
 # Set (write content / title / state)
 # ---------------------------------------------------------------------------
 
+_UNSET = object()
+
+
 def update_section_content(
     conn: sqlite3.Connection,
     section_id: str,
@@ -482,15 +493,23 @@ def update_section_content(
     title: str | None = None,  # None = leave unchanged; pass empty string to clear
     state: str | None = None,  # None = leave unchanged
     seed: str | None = None,   # None = leave unchanged
+    tags=_UNSET,               # _UNSET = leave unchanged; pass list to replace; [] to clear
     updated_by: str,
     session_id: str | None,
     now: int,
 ) -> None:
-    """Update a section's content (and optionally title/state/seed).
+    """Update a section's content (and optionally title/state/seed/tags).
 
-    A None argument means "leave that field unchanged" (COALESCE-style).
+    Most arguments use None = "leave field unchanged" (COALESCE-style).
+    Tags use a sentinel because None could legitimately mean "no tags
+    given" -- pass the empty list [] to clear, a non-empty list to
+    replace, or leave unset to keep the existing value.
+
     Title is treated specially: pass empty string to clear it (turn the
     section into a headless preamble); pass None to leave unchanged.
+
+    Tags are caller's responsibility to normalize via util.normalize_tags
+    before passing -- we just serialize whatever we're given.
     """
     word_count = _count_words(content) if content else 0
     set_clauses = ["content=?", "word_count=?", "updated_at=?", "updated_by=?",
@@ -506,6 +525,14 @@ def update_section_content(
     if seed is not None:
         set_clauses.append("seed=?")
         params.append(seed)
+    if tags is not _UNSET:
+        set_clauses.append("tags=?")
+        # Tags is `list[str] | None` at this point (sentinel filtered);
+        # treat None / empty list as "store NULL".
+        if tags:
+            params.append(tags_to_json(list(tags)))  # type: ignore[arg-type]
+        else:
+            params.append(None)
 
     params.append(section_id)
     conn.execute(
